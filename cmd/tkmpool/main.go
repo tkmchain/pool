@@ -146,6 +146,7 @@ func loadConfig(path string) (Config, error) {
 	if cfg.BlockRewardAntd <= 0 {
 		cfg.BlockRewardAntd = 100
 	}
+	cfg.PoolWallet = normalizeAddress(cfg.PoolWallet)
 	return cfg, nil
 }
 
@@ -179,9 +180,22 @@ func (p *Pool) loadPayoutState() {
 	}
 	p.mu.Lock()
 	if state.Balances != nil {
-		p.balances = state.Balances
+		balances := make(map[string]float64, len(state.Balances))
+		for wallet, balance := range state.Balances {
+			normalized := normalizeAddress(wallet)
+			if !isValidAddress(normalized) {
+				log.Printf("dropping invalid payout balance wallet=%s balance=%f", wallet, balance)
+				continue
+			}
+			balances[normalized] += balance
+		}
+		p.balances = balances
 	}
 	p.payments = append([]Payment(nil), state.Payments...)
+	for i := range p.payments {
+		p.payments[i].Wallet = normalizeAddress(p.payments[i].Wallet)
+	}
+	p.savePayoutStateLocked()
 	p.mu.Unlock()
 }
 
@@ -331,7 +345,12 @@ func parseAuthorize(raw json.RawMessage) (string, string) {
 	}
 	user := params[0]
 	wallet, worker, _ := strings.Cut(user, ".")
-	return strings.TrimSpace(wallet), strings.TrimSpace(worker)
+	wallet = normalizeAddress(wallet)
+	if !isValidAddress(wallet) {
+		log.Printf("invalid miner payout wallet rejected wallet=%s", strings.TrimSpace(wallet))
+		return "", strings.TrimSpace(worker)
+	}
+	return wallet, strings.TrimSpace(worker)
 }
 
 func (p *Pool) touchMiner(wallet, worker string) {
@@ -409,6 +428,32 @@ func normalizeHex(s string) string {
 		return s
 	}
 	return "0x" + s
+}
+
+func normalizeAddress(s string) string {
+	s = strings.TrimSpace(s)
+	for len(s) >= 2 && strings.EqualFold(s[:2], "0x") {
+		s = s[2:]
+	}
+	if len(s) == 40 && isHexString(s) {
+		return "0x" + s
+	}
+	return strings.TrimSpace(s)
+}
+
+func isValidAddress(s string) bool {
+	s = normalizeAddress(s)
+	return len(s) == 42 && strings.HasPrefix(strings.ToLower(s), "0x") && isHexString(s[2:])
+}
+
+func isHexString(s string) bool {
+	for _, c := range s {
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (p *Pool) paymentLoop(ctx context.Context) {
@@ -617,6 +662,14 @@ func (r *RPCClient) SubmitWorkRaw(ctx context.Context, nonce, sealHash, digest s
 }
 
 func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd float64) (string, error) {
+	from = normalizeAddress(from)
+	to = normalizeAddress(to)
+	if !isValidAddress(from) {
+		return "", fmt.Errorf("invalid payout from address %q", from)
+	}
+	if !isValidAddress(to) {
+		return "", fmt.Errorf("invalid payout to address %q", to)
+	}
 	valueWei := antdToWeiHex(amountAntd)
 	var tx string
 	err := r.call(ctx, "eth_sendTransaction", []any{map[string]any{"from": from, "to": to, "value": valueWei}}, &tx)

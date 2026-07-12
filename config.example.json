@@ -4,13 +4,13 @@
   "listenStratum": "0.0.0.0:3333",
   "nodeRPC": "http://127.0.0.1:8545",
   "workMethod": "miner",
-  "poolWallet": "0xf5B61956a2D737D143F5999ead15a8421Bfd9171",
+  "poolWallet": "0x348b00a3a3c87291539b59aD0Bd1b811e598bE95",
   "payoutStateFile": "payout-state.json",
   "blockRewardAntd": 100.0,
   "networkFeePercent": 1.0,
   "minPayoutAntd": 5.0,
   "paymentMode": "PROP",
-  "autoPay": false,
+  "autoPay": true,
   "paymentIntervalSeconds": 300
 }
 
