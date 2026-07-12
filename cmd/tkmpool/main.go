@@ -59,6 +59,7 @@ type Miner struct {
 	Worker         string    `json:"worker"`
 	AcceptedShares uint64    `json:"acceptedShares"`
 	RejectedShares uint64    `json:"rejectedShares"`
+	RoundShares    uint64    `json:"roundShares"`
 	LastSeen       time.Time `json:"lastSeen"`
 }
 
@@ -427,6 +428,7 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	m.LastSeen = time.Now()
 	if shareAccepted {
 		m.AcceptedShares++
+		m.RoundShares++
 		p.shares.Add(1)
 	} else {
 		m.RejectedShares++
@@ -500,10 +502,9 @@ func (p *Pool) calculateRound(blockRewardAntd float64) {
 	total := uint64(0)
 	byWallet := map[string]uint64{}
 	for _, m := range p.miners {
-		total += m.AcceptedShares
-		byWallet[m.Wallet] += m.AcceptedShares
-		m.AcceptedShares = 0
-		m.RejectedShares = 0
+		total += m.RoundShares
+		byWallet[m.Wallet] += m.RoundShares
+		m.RoundShares = 0
 	}
 	if total == 0 {
 		return
@@ -513,6 +514,24 @@ func (p *Pool) calculateRound(blockRewardAntd float64) {
 		p.balances[wallet] += netReward * float64(shares) / float64(total)
 	}
 	p.savePayoutStateLocked()
+}
+
+func (p *Pool) pendingBalancesLocked() map[string]float64 {
+	total := uint64(0)
+	byWallet := map[string]uint64{}
+	for _, m := range p.miners {
+		total += m.RoundShares
+		byWallet[m.Wallet] += m.RoundShares
+	}
+	pending := make(map[string]float64, len(byWallet))
+	if total == 0 {
+		return pending
+	}
+	netReward := p.cfg.BlockRewardAntd * (1 - p.cfg.NetworkFeePercent/100)
+	for wallet, shares := range byWallet {
+		pending[wallet] = round(netReward * float64(shares) / float64(total))
+	}
+	return pending
 }
 
 func (p *Pool) payDue(ctx context.Context) {
@@ -606,26 +625,28 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 	for k, v := range p.balances {
 		balances[k] = round(v)
 	}
+	pendingBalances := p.pendingBalancesLocked()
 	payments := append([]Payment(nil), p.payments...)
 	work := p.work
 	p.mu.RUnlock()
 
 	resp := map[string]any{
-		"poolName":      p.cfg.PoolName,
-		"paymentMode":   p.cfg.PaymentMode,
-		"workMethod":    p.cfg.WorkMethod,
-		"autoPay":       p.cfg.AutoPay,
-		"minPayoutAntd": p.cfg.MinPayoutAntd,
-		"feePercent":    p.cfg.NetworkFeePercent,
-		"stratum":       p.cfg.ListenStratum,
-		"nodeRPC":       p.cfg.NodeRPC,
-		"poolWallet":    p.cfg.PoolWallet,
-		"uptimeSeconds": int(time.Since(p.started).Seconds()),
-		"totalShares":   p.shares.Load(),
-		"work":          work,
-		"miners":        miners,
-		"balances":      balances,
-		"payments":      payments,
+		"poolName":        p.cfg.PoolName,
+		"paymentMode":     p.cfg.PaymentMode,
+		"workMethod":      p.cfg.WorkMethod,
+		"autoPay":         p.cfg.AutoPay,
+		"minPayoutAntd":   p.cfg.MinPayoutAntd,
+		"feePercent":      p.cfg.NetworkFeePercent,
+		"stratum":         p.cfg.ListenStratum,
+		"nodeRPC":         p.cfg.NodeRPC,
+		"poolWallet":      p.cfg.PoolWallet,
+		"uptimeSeconds":   int(time.Since(p.started).Seconds()),
+		"totalShares":     p.shares.Load(),
+		"work":            work,
+		"miners":          miners,
+		"balances":        balances,
+		"pendingBalances": pendingBalances,
+		"payments":        payments,
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -880,7 +901,7 @@ const indexHTML = `<!doctype html>
         </tbody>
       </table>
       <h2 style="margin-top:18px">Balances</h2>
-      <table><thead><tr><th>Wallet</th><th>Balance ANTD</th></tr></thead><tbody id="balances"></tbody></table>
+      <table><thead><tr><th>Wallet</th><th>Confirmed ANTD</th><th>Pending Round ANTD</th></tr></thead><tbody id="balances"></tbody></table>
     </section>
 
     <section class="section panel">
@@ -911,7 +932,8 @@ const indexHTML = `<!doctype html>
       $('fee').textContent = s.feePercent + '%';
       $('autoPay').innerHTML = s.autoPay ? '<span class="ok">enabled</span>' : '<span class="bad">disabled</span>';
       $('miners').innerHTML = s.miners.map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '']);
-      $('balances').innerHTML = Object.entries(s.balances).map(([w,b]) => row([w, b])).join('') || row(['No balances yet', '0']);
+      const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
+      document.getElementById("balances").innerHTML = wallets.map(w => row([w, (s.balances || {})[w] || 0, (s.pendingBalances || {})[w] || 0])).join("") || row(["No balances yet", "0", "0"]);
       $('payments').innerHTML = s.payments.map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
     }
     $('refresh').onclick = load;
