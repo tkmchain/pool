@@ -44,7 +44,7 @@ Use the payout wallet as username. Worker names are supported with
 
 ## Payments
 
-The pool accounts the configured `blockRewardAntd` proportionally when the daemon accepts a submitted block candidate. Balances and payment history are persisted to `payoutStateFile`, so a restart does not erase unpaid miner balances. Failed payout transactions are recorded in the payment list and the miner balance is kept for the next run.
+The pool accounts the configured `blockRewardAntd` proportionally when the daemon accepts a submitted block candidate. Balances and payment history are persisted to `payoutStateFile`, so a restart does not erase unpaid miner balances. Autopay checks the pool wallet balance at `eth_blockNumber - paymentConfirmations` and only sends payouts that fit inside that confirmed balance after `payoutReserveAntd` is kept aside. Failed payout transactions are recorded in the payment list and the miner balance is kept for the next run.
 
 Automatic payment broadcasting is disabled by default. To enable it, set `autoPay` to `true`, set `minPayoutAntd`, and make sure `poolWallet` is a funded hot wallet controlled by the node signer. The pool sends payouts through `eth_sendTransaction`; it does not store private keys.
 
@@ -129,7 +129,10 @@ clef --configdir ~/.clef-tkm-egypt \
   "blockRewardAntd": 100.0,
   "minPayoutAntd": 5.0,
   "autoPay": true,
-  "paymentIntervalSeconds": 300
+  "paymentIntervalSeconds": 300,
+  "paymentConfirmations": 12,
+  "payoutReserveAntd": 0.1,
+  "rpcTimeoutSeconds": 60
 }
 ```
 

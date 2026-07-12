@@ -36,6 +36,9 @@ type Config struct {
 	PaymentMode            string  `json:"paymentMode"`
 	AutoPay                bool    `json:"autoPay"`
 	PaymentIntervalSeconds int     `json:"paymentIntervalSeconds"`
+	PaymentConfirmations   int     `json:"paymentConfirmations"`
+	PayoutReserveAntd      float64 `json:"payoutReserveAntd"`
+	RPCTimeoutSeconds      int     `json:"rpcTimeoutSeconds"`
 }
 
 type PayoutState struct {
@@ -76,6 +79,7 @@ type Pool struct {
 	payments []Payment
 	started  time.Time
 	shares   atomic.Uint64
+	paying   atomic.Bool
 }
 
 type RPCClient struct {
@@ -126,6 +130,9 @@ func loadConfig(path string) (Config, error) {
 		MinPayoutAntd:          5,
 		PaymentMode:            "PROP",
 		PaymentIntervalSeconds: 300,
+		PaymentConfirmations:   12,
+		PayoutReserveAntd:      0.1,
+		RPCTimeoutSeconds:      60,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -136,6 +143,12 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.PaymentIntervalSeconds <= 0 {
 		cfg.PaymentIntervalSeconds = 300
+	}
+	if cfg.PaymentConfirmations < 0 {
+		cfg.PaymentConfirmations = 0
+	}
+	if cfg.RPCTimeoutSeconds <= 0 {
+		cfg.RPCTimeoutSeconds = 60
 	}
 	if cfg.WorkMethod == "" {
 		cfg.WorkMethod = "miner"
@@ -153,7 +166,7 @@ func loadConfig(path string) (Config, error) {
 func NewPool(cfg Config) *Pool {
 	pool := &Pool{
 		cfg:      cfg,
-		rpc:      &RPCClient{endpoint: cfg.NodeRPC, method: strings.ToLower(cfg.WorkMethod), client: &http.Client{Timeout: 10 * time.Second}},
+		rpc:      &RPCClient{endpoint: cfg.NodeRPC, method: strings.ToLower(cfg.WorkMethod), client: &http.Client{Timeout: time.Duration(cfg.RPCTimeoutSeconds) * time.Second}},
 		miners:   make(map[string]*Miner),
 		balances: make(map[string]float64),
 		started:  time.Now(),
@@ -493,6 +506,11 @@ func (p *Pool) calculateRound(blockRewardAntd float64) {
 }
 
 func (p *Pool) payDue(ctx context.Context) {
+	if !p.paying.CompareAndSwap(false, true) {
+		return
+	}
+	defer p.paying.Store(false)
+
 	p.mu.RLock()
 	var due []Payment
 	for wallet, balance := range p.balances {
@@ -501,8 +519,27 @@ func (p *Pool) payDue(ctx context.Context) {
 		}
 	}
 	p.mu.RUnlock()
+	if len(due) == 0 {
+		return
+	}
+
+	confirmedBalance, blockNumber, err := p.rpc.ConfirmedBalance(ctx, p.cfg.PoolWallet, p.cfg.PaymentConfirmations)
+	if err != nil {
+		log.Printf("autopay skipped: confirmed pool balance check failed: %v", err)
+		return
+	}
+	spendable := new(big.Int).Sub(confirmedBalance, antdToWeiInt(p.cfg.PayoutReserveAntd))
+	if spendable.Sign() <= 0 {
+		log.Printf("autopay skipped: confirmed pool balance is below reserve block=%d balanceWei=%s reserveAntd=%f", blockNumber, confirmedBalance.String(), p.cfg.PayoutReserveAntd)
+		return
+	}
 
 	for _, payment := range due {
+		amountWei := antdToWeiInt(payment.Amount)
+		if amountWei.Cmp(spendable) > 0 {
+			log.Printf("autopay waiting for confirmed pool balance wallet=%s amountAntd=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
+			continue
+		}
 		tx, err := p.rpc.SendPayment(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
 		p.mu.Lock()
 		if err != nil {
@@ -514,6 +551,7 @@ func (p *Pool) payDue(ctx context.Context) {
 			if p.balances[payment.Wallet] <= 0 {
 				delete(p.balances, payment.Wallet)
 			}
+			spendable.Sub(spendable, amountWei)
 		}
 		p.payments = append(p.payments, payment)
 		p.savePayoutStateLocked()
@@ -661,6 +699,41 @@ func (r *RPCClient) SubmitWorkRaw(ctx context.Context, nonce, sealHash, digest s
 	return accepted, nil
 }
 
+func (r *RPCClient) BlockNumber(ctx context.Context) (uint64, error) {
+	var blockHex string
+	if err := r.call(ctx, "eth_blockNumber", []any{}, &blockHex); err != nil {
+		return 0, err
+	}
+	return parseUintFlexible(blockHex), nil
+}
+
+func (r *RPCClient) ConfirmedBalance(ctx context.Context, address string, confirmations int) (*big.Int, uint64, error) {
+	address = normalizeAddress(address)
+	if !isValidAddress(address) {
+		return nil, 0, fmt.Errorf("invalid balance address %q", address)
+	}
+	head, err := r.BlockNumber(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	confirmed := head
+	if confirmations > 0 {
+		if head < uint64(confirmations) {
+			return nil, head, fmt.Errorf("head block %d has fewer than %d confirmations", head, confirmations)
+		}
+		confirmed = head - uint64(confirmations)
+	}
+	var balanceHex string
+	if err := r.call(ctx, "eth_getBalance", []any{address, fmt.Sprintf("0x%x", confirmed)}, &balanceHex); err != nil {
+		return nil, confirmed, err
+	}
+	balance, ok := new(big.Int).SetString(strings.TrimPrefix(balanceHex, "0x"), 16)
+	if !ok {
+		return nil, confirmed, fmt.Errorf("invalid balance result %q", balanceHex)
+	}
+	return balance, confirmed, nil
+}
+
 func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd float64) (string, error) {
 	from = normalizeAddress(from)
 	to = normalizeAddress(to)
@@ -677,9 +750,13 @@ func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd
 }
 
 func antdToWeiHex(amount float64) string {
+	return "0x" + antdToWeiInt(amount).Text(16)
+}
+
+func antdToWeiInt(amount float64) *big.Int {
 	wei := new(big.Float).Mul(big.NewFloat(amount), big.NewFloat(1e18))
 	i, _ := wei.Int(nil)
-	return "0x" + i.Text(16)
+	return i
 }
 
 func randomHex(n int) string {

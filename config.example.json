@@ -11,6 +11,9 @@
   "minPayoutAntd": 5.0,
   "paymentMode": "PROP",
   "autoPay": true,
-  "paymentIntervalSeconds": 300
+  "paymentIntervalSeconds": 300,
+  "paymentConfirmations": 12,
+  "payoutReserveAntd": 0.1,
+  "rpcTimeoutSeconds": 60
 }
 
