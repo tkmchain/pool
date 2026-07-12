@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -29,7 +30,10 @@ type Config struct {
 	NodeRPC                string  `json:"nodeRPC"`
 	WorkMethod             string  `json:"workMethod"`
 	PoolWallet             string  `json:"poolWallet"`
-	PayoutStateFile        string  `json:"payoutStateFile"`
+	RedisAddr              string  `json:"redisAddr"`
+	RedisPassword          string  `json:"redisPassword"`
+	RedisDB                int     `json:"redisDB"`
+	RedisStateKey          string  `json:"redisStateKey"`
 	BlockRewardAntd        float64 `json:"blockRewardAntd"`
 	NetworkFeePercent      float64 `json:"networkFeePercent"`
 	MinPayoutAntd          float64 `json:"minPayoutAntd"`
@@ -139,7 +143,7 @@ func loadConfig(path string) (Config, error) {
 		ListenStratum:          "0.0.0.0:3333",
 		NodeRPC:                "http://127.0.0.1:8545",
 		WorkMethod:             "miner",
-		PayoutStateFile:        "payout-state.json",
+		RedisStateKey:          "tkmpool:payout-state",
 		BlockRewardAntd:        100,
 		NetworkFeePercent:      1,
 		MinPayoutAntd:          5,
@@ -173,13 +177,16 @@ func loadConfig(path string) (Config, error) {
 		cfg.ShareTarget = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	}
 	cfg.ShareTarget = normalizeHex(cfg.ShareTarget)
-	if cfg.PayoutStateFile == "" {
-		cfg.PayoutStateFile = "payout-state.json"
+	if cfg.RedisStateKey == "" {
+		cfg.RedisStateKey = "tkmpool:payout-state"
 	}
 	if cfg.BlockRewardAntd <= 0 {
 		cfg.BlockRewardAntd = 100
 	}
 	cfg.PoolWallet = normalizeAddress(cfg.PoolWallet)
+	if cfg.RedisAddr == "" {
+		cfg.RedisAddr = "127.0.0.1:6379"
+	}
 	return cfg, nil
 }
 
@@ -198,22 +205,19 @@ func NewPool(cfg Config) *Pool {
 }
 
 func (p *Pool) loadPayoutState() {
-	if p.cfg.PayoutStateFile == "" {
-		return
-	}
-	b, err := os.ReadFile(p.cfg.PayoutStateFile)
+	state, ok, err := p.readRedisPayoutState()
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("payout state read failed: %v", err)
-		}
-		return
-	}
-	var state PayoutState
-	if err := json.Unmarshal(b, &state); err != nil {
-		log.Printf("payout state decode failed: %v", err)
-		return
+		log.Fatalf("redis payout state read failed: %v", err)
 	}
 	p.mu.Lock()
+	if ok {
+		p.applyPayoutStateLocked(state)
+	}
+	p.savePayoutStateLocked()
+	p.mu.Unlock()
+}
+
+func (p *Pool) applyPayoutStateLocked(state PayoutState) {
 	if state.Balances != nil {
 		balances := make(map[string]float64, len(state.Balances))
 		for wallet, balance := range state.Balances {
@@ -230,14 +234,24 @@ func (p *Pool) loadPayoutState() {
 	for i := range p.payments {
 		p.payments[i].Wallet = normalizeAddress(p.payments[i].Wallet)
 	}
-	p.savePayoutStateLocked()
-	p.mu.Unlock()
+}
+
+func (p *Pool) readRedisPayoutState() (PayoutState, bool, error) {
+	b, err := p.redisCommand("GET", p.cfg.RedisStateKey)
+	if err != nil {
+		return PayoutState{}, false, err
+	}
+	if b == nil {
+		return PayoutState{}, false, nil
+	}
+	var state PayoutState
+	if err := json.Unmarshal(b, &state); err != nil {
+		return PayoutState{}, false, err
+	}
+	return state, true, nil
 }
 
 func (p *Pool) savePayoutStateLocked() {
-	if p.cfg.PayoutStateFile == "" {
-		return
-	}
 	state := PayoutState{
 		Balances: make(map[string]float64, len(p.balances)),
 		Payments: append([]Payment(nil), p.payments...),
@@ -250,8 +264,76 @@ func (p *Pool) savePayoutStateLocked() {
 		log.Printf("payout state encode failed: %v", err)
 		return
 	}
-	if err := os.WriteFile(p.cfg.PayoutStateFile, b, 0600); err != nil {
-		log.Printf("payout state write failed: %v", err)
+	if _, err := p.redisCommand("SET", p.cfg.RedisStateKey, string(b)); err != nil {
+		log.Fatalf("redis payout state write failed: %v", err)
+	}
+}
+
+func (p *Pool) redisCommand(command string, args ...string) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", p.cfg.RedisAddr, time.Duration(p.cfg.RPCTimeoutSeconds)*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(time.Duration(p.cfg.RPCTimeoutSeconds) * time.Second))
+	reader := bufio.NewReader(conn)
+	if p.cfg.RedisPassword != "" {
+		if _, err := redisWriteRead(conn, reader, "AUTH", p.cfg.RedisPassword); err != nil {
+			return nil, err
+		}
+	}
+	if p.cfg.RedisDB > 0 {
+		if _, err := redisWriteRead(conn, reader, "SELECT", strconv.Itoa(p.cfg.RedisDB)); err != nil {
+			return nil, err
+		}
+	}
+	return redisWriteRead(conn, reader, append([]string{command}, args...)...)
+}
+
+func redisWriteRead(conn net.Conn, reader *bufio.Reader, parts ...string) ([]byte, error) {
+	if _, err := fmt.Fprintf(conn, "*%d\r\n", len(parts)); err != nil {
+		return nil, err
+	}
+	for _, part := range parts {
+		if _, err := fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(part), part); err != nil {
+			return nil, err
+		}
+	}
+	return redisReadRESP(reader)
+}
+
+func redisReadRESP(reader *bufio.Reader) ([]byte, error) {
+	prefix, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+	switch prefix {
+	case '+':
+		return []byte(line), nil
+	case '-':
+		return nil, fmt.Errorf("redis error: %s", line)
+	case ':':
+		return []byte(line), nil
+	case '$':
+		n, err := strconv.Atoi(line)
+		if err != nil {
+			return nil, err
+		}
+		if n < 0 {
+			return nil, nil
+		}
+		b := make([]byte, n+2)
+		if _, err := io.ReadFull(reader, b); err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	default:
+		return nil, fmt.Errorf("unsupported redis response prefix %q", prefix)
 	}
 }
 
