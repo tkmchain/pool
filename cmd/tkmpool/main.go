@@ -79,9 +79,22 @@ type Pool struct {
 	miners   map[string]*Miner
 	balances map[string]float64
 	payments []Payment
+	jobs     map[string]Work
+	sessions map[*stratumSession]struct{}
 	started  time.Time
 	shares   atomic.Uint64
 	paying   atomic.Bool
+}
+
+type stratumSession struct {
+	enc *json.Encoder
+	mu  sync.Mutex
+}
+
+func (s *stratumSession) write(v any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.enc.Encode(v)
 }
 
 type RPCClient struct {
@@ -176,6 +189,8 @@ func NewPool(cfg Config) *Pool {
 		rpc:      &RPCClient{endpoint: cfg.NodeRPC, method: strings.ToLower(cfg.WorkMethod), client: &http.Client{Timeout: time.Duration(cfg.RPCTimeoutSeconds) * time.Second}},
 		miners:   make(map[string]*Miner),
 		balances: make(map[string]float64),
+		jobs:     make(map[string]Work),
+		sessions: make(map[*stratumSession]struct{}),
 		started:  time.Now(),
 	}
 	pool.loadPayoutState()
@@ -247,10 +262,21 @@ func (p *Pool) pollWork(ctx context.Context) {
 		work, err := p.rpc.GetWork(ctx)
 		if err != nil {
 			log.Printf("work poll failed: %v", err)
-		} else {
+		} else if work.SealHash != "" {
+			var sessions []*stratumSession
 			p.mu.Lock()
+			changed := p.work.SealHash != work.SealHash
 			p.work = work
+			p.jobs[jobID(work)] = work
+			if changed {
+				for session := range p.sessions {
+					sessions = append(sessions, session)
+				}
+			}
 			p.mu.Unlock()
+			for _, session := range sessions {
+				p.notify(session, work)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -296,6 +322,15 @@ func (p *Pool) handleStratum(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Minute))
 	dec := json.NewDecoder(conn)
 	enc := json.NewEncoder(conn)
+	session := &stratumSession{enc: enc}
+	p.mu.Lock()
+	p.sessions[session] = struct{}{}
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.sessions, session)
+		p.mu.Unlock()
+	}()
 
 	sessionID := randomHex(8)
 	wallet := ""
@@ -312,49 +347,57 @@ func (p *Pool) handleStratum(conn net.Conn) {
 
 		switch req.Method {
 		case "mining.subscribe":
-			_ = enc.Encode(map[string]any{
+			session.write(map[string]any{
 				"id":     req.ID,
 				"result": []any{[]any{[]any{"mining.notify", sessionID}}, sessionID, 4},
 				"error":  nil,
 			})
-			p.notify(enc)
+			p.notifyCurrent(session)
 		case "mining.authorize":
 			wallet, worker = parseAuthorize(req.Params)
 			p.touchMiner(wallet, worker)
-			_ = enc.Encode(map[string]any{"id": req.ID, "result": wallet != "", "error": nil})
+			session.write(map[string]any{"id": req.ID, "result": wallet != "", "error": nil})
 		case "mining.submit":
 			if wallet == "" {
-				_ = enc.Encode(map[string]any{"id": req.ID, "result": false, "error": "unauthorized"})
+				session.write(map[string]any{"id": req.ID, "result": false, "error": "unauthorized"})
 				continue
 			}
 			ok := p.submitShare(context.Background(), wallet, worker, req.Params)
-			_ = enc.Encode(map[string]any{"id": req.ID, "result": ok, "error": nil})
+			session.write(map[string]any{"id": req.ID, "result": ok, "error": nil})
 		case "mining.extranonce.subscribe":
-			_ = enc.Encode(map[string]any{"id": req.ID, "result": true, "error": nil})
+			session.write(map[string]any{"id": req.ID, "result": true, "error": nil})
 		default:
-			_ = enc.Encode(map[string]any{"id": req.ID, "result": nil, "error": "unsupported method"})
+			session.write(map[string]any{"id": req.ID, "result": nil, "error": "unsupported method"})
 		}
 	}
 }
 
-func (p *Pool) notify(enc *json.Encoder) {
+func (p *Pool) notifyCurrent(session *stratumSession) {
 	p.mu.RLock()
 	work := p.work
 	p.mu.RUnlock()
+	p.notify(session, work)
+}
+
+func (p *Pool) notify(session *stratumSession, work Work) {
 	if work.SealHash == "" {
 		return
 	}
-	_ = enc.Encode(map[string]any{
+	session.write(map[string]any{
 		"id":     nil,
 		"method": "mining.notify",
 		"params": []any{
-			strconv.FormatUint(work.Height, 16),
+			jobID(work),
 			work.SealHash,
 			work.SeedHash,
 			p.cfg.ShareTarget,
 			true,
 		},
 	})
+}
+
+func jobID(work Work) string {
+	return work.SealHash
 }
 
 func parseAuthorize(raw json.RawMessage) (string, string) {
@@ -388,12 +431,38 @@ func (p *Pool) touchMiner(wallet, worker string) {
 	m.LastSeen = time.Now()
 }
 
+func (p *Pool) recordRejectedShare(wallet, worker string) {
+	key := wallet + "." + worker
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	m := p.miners[key]
+	if m == nil {
+		m = &Miner{Wallet: wallet, Worker: worker}
+		p.miners[key] = m
+	}
+	m.LastSeen = time.Now()
+	m.RejectedShares++
+}
+
 func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage) bool {
 	var params []string
 	_ = json.Unmarshal(raw, &params)
 	p.mu.RLock()
 	work := p.work
+	staleJob := false
+	if len(params) >= 2 {
+		if job, ok := p.jobs[params[1]]; ok {
+			work = job
+		} else {
+			staleJob = true
+		}
+	}
 	p.mu.RUnlock()
+	if staleJob {
+		log.Printf("stale share rejected wallet=%s worker=%s job=%s", wallet, worker, params[1])
+		p.recordRejectedShare(wallet, worker)
+		return false
+	}
 
 	shareAccepted := false
 	blockAccepted := false
@@ -901,7 +970,7 @@ const indexHTML = `<!doctype html>
         </tbody>
       </table>
       <h2 style="margin-top:18px">Balances</h2>
-      <table><thead><tr><th>Wallet</th><th>Confirmed ANTD</th><th>Pending Round ANTD</th></tr></thead><tbody id="balances"></tbody></table>
+      <table><thead><tr><th>Wallet</th><th>Confirmed ANTD</th><th>Pending Round ANTD</th><th>Total ANTD</th></tr></thead><tbody id="balances"></tbody></table>
     </section>
 
     <section class="section panel">
@@ -933,7 +1002,7 @@ const indexHTML = `<!doctype html>
       $('autoPay').innerHTML = s.autoPay ? '<span class="ok">enabled</span>' : '<span class="bad">disabled</span>';
       $('miners').innerHTML = s.miners.map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '']);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
-      document.getElementById("balances").innerHTML = wallets.map(w => row([w, (s.balances || {})[w] || 0, (s.pendingBalances || {})[w] || 0])).join("") || row(["No balances yet", "0", "0"]);
+      document.getElementById("balances").innerHTML = wallets.map(w => row([w, (s.balances || {})[w] || 0, (s.pendingBalances || {})[w] || 0, (((s.balances || {})[w] || 0) + ((s.pendingBalances || {})[w] || 0)).toFixed(8)])).join("") || row(["No balances yet", "0", "0", "0"]);
       $('payments').innerHTML = s.payments.map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
     }
     $('refresh').onclick = load;
