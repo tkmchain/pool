@@ -40,7 +40,7 @@ stratum+tcp://127.0.0.1:3333
 ```
 
 Use the payout wallet as username. Worker names are supported with
-`0xWallet.worker1`.
+`0xWallet.worker1`. Pool share acceptance uses `shareTarget`; block candidates are still checked against the daemon work target before submission.
 
 ## Payments
 
@@ -132,7 +132,8 @@ clef --configdir ~/.clef-tkm-egypt \
   "paymentIntervalSeconds": 300,
   "paymentConfirmations": 12,
   "payoutReserveAntd": 0.1,
-  "rpcTimeoutSeconds": 60
+  "rpcTimeoutSeconds": 60,
+  "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 }
 ```
 

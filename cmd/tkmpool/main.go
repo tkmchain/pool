@@ -39,6 +39,7 @@ type Config struct {
 	PaymentConfirmations   int     `json:"paymentConfirmations"`
 	PayoutReserveAntd      float64 `json:"payoutReserveAntd"`
 	RPCTimeoutSeconds      int     `json:"rpcTimeoutSeconds"`
+	ShareTarget            string  `json:"shareTarget"`
 }
 
 type PayoutState struct {
@@ -133,6 +134,7 @@ func loadConfig(path string) (Config, error) {
 		PaymentConfirmations:   12,
 		PayoutReserveAntd:      0.1,
 		RPCTimeoutSeconds:      60,
+		ShareTarget:            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -153,6 +155,10 @@ func loadConfig(path string) (Config, error) {
 	if cfg.WorkMethod == "" {
 		cfg.WorkMethod = "miner"
 	}
+	if cfg.ShareTarget == "" {
+		cfg.ShareTarget = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+	}
+	cfg.ShareTarget = normalizeHex(cfg.ShareTarget)
 	if cfg.PayoutStateFile == "" {
 		cfg.PayoutStateFile = "payout-state.json"
 	}
@@ -344,7 +350,7 @@ func (p *Pool) notify(enc *json.Encoder) {
 			strconv.FormatUint(work.Height, 16),
 			work.SealHash,
 			work.SeedHash,
-			work.Target,
+			p.cfg.ShareTarget,
 			true,
 		},
 	})
@@ -388,19 +394,23 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	work := p.work
 	p.mu.RUnlock()
 
-	accepted := false
+	shareAccepted := false
+	blockAccepted := false
 	if work.SealHash != "" && len(params) >= 4 {
 		nonce := normalizeHex(params[2])
 		digest := normalizeHex(params[3])
 		if nonce != "" && digest != "" {
-			if !digestMeetsTarget(digest, work.Target) {
-				log.Printf("share below block target wallet=%s worker=%s nonce=%s", wallet, worker, nonce)
+			if digestMeetsTarget(digest, p.cfg.ShareTarget) {
+				shareAccepted = true
 			} else {
+				log.Printf("share below pool target wallet=%s worker=%s nonce=%s", wallet, worker, nonce)
+			}
+			if shareAccepted && digestMeetsTarget(digest, work.Target) {
 				var err error
-				accepted, err = p.rpc.SubmitWorkRaw(ctx, nonce, work.SealHash, digest)
+				blockAccepted, err = p.rpc.SubmitWorkRaw(ctx, nonce, work.SealHash, digest)
 				if err != nil {
-					log.Printf("share submit failed wallet=%s worker=%s err=%v", wallet, worker, err)
-				} else if !accepted {
+					log.Printf("block candidate submit failed wallet=%s worker=%s err=%v", wallet, worker, err)
+				} else if !blockAccepted {
 					log.Printf("block candidate rejected by daemon wallet=%s worker=%s nonce=%s", wallet, worker, nonce)
 				}
 			}
@@ -415,7 +425,7 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 		p.miners[key] = m
 	}
 	m.LastSeen = time.Now()
-	if accepted {
+	if shareAccepted {
 		m.AcceptedShares++
 		p.shares.Add(1)
 	} else {
@@ -423,13 +433,13 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	}
 	p.mu.Unlock()
 
-	if accepted {
+	if blockAccepted {
 		p.calculateRound(p.cfg.BlockRewardAntd)
 		if p.cfg.AutoPay {
 			go p.payDue(context.Background())
 		}
 	}
-	return accepted
+	return shareAccepted
 }
 
 func normalizeHex(s string) string {
