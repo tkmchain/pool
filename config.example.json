@@ -5,6 +5,7 @@
   "nodeRPC": "http://127.0.0.1:8545",
   "workMethod": "miner",
   "poolWallet": "0x348b00a3a3c87291539b59aD0Bd1b811e598bE95",
+  "poolWalletPassword": "",
   "redisAddr": "127.0.0.1:6379",
   "redisPassword": "",
   "redisDB": 0,

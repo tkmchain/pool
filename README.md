@@ -25,7 +25,7 @@ Run a full Tkmchain node with RandomX/miner APIs enabled:
 
 ```sh
 gtkm --syncmode=full --http --http.addr 127.0.0.1 \
-  --http.api eth,net,web3,miner,randomx \
+  --http.api eth,net,web3,miner,randomx,tkm \
   --mine --miner.threads=1 --miner.etherbase=0xYourPoolWallet
 ```
 
@@ -46,7 +46,7 @@ Use the payout wallet as username. Worker names are supported with
 
 The pool accounts the configured `blockRewardAntd` proportionally when the daemon accepts a submitted block candidate. Balances and payment history are persisted only to Redis. On startup the pool connects to Redis and writes an empty state if the key does not exist, so Redis must be running before the pool starts. Autopay checks the pool wallet balance at `eth_blockNumber - paymentConfirmations` and only sends payouts that fit inside that confirmed balance after `payoutReserveAntd` is kept aside. Failed payout transactions are recorded in the payment list and the miner balance is kept for the next run.
 
-Automatic payment broadcasting is disabled by default. To enable it, set `autoPay` to `true`, set `minPayoutAntd`, and make sure `poolWallet` is a funded hot wallet controlled by the node signer. The pool sends payouts through `eth_sendTransaction`; it does not store private keys.
+Automatic payment broadcasting is disabled by default. To enable it, set `autoPay` to `true`, set `minPayoutAntd`, and make sure `poolWallet` is a funded hot wallet. For password mode, set `poolWalletPassword`; the pool calls `tkm_sendTransactionWithPassphrase` for each payout transaction, so the wallet is not globally unlocked. If `poolWalletPassword` is empty, use Clef or another node signer with `eth_sendTransaction` instead.
 
 Redis setup for payment state:
 
@@ -55,7 +55,7 @@ sudo systemctl enable --now redis-server
 redis-cli GET tkmpool:payout-state
 ```
 
-The pool saves balances and payment history to `redisStateKey` after each accounting or payout update. Keep Redis bound to localhost unless you configure authentication and firewall rules.
+The pool saves balances, payment history, miner wallet addresses, worker names, accepted/rejected shares, round shares, last-seen timestamps, and total share count to `redisStateKey` after miner or payout updates. The HTML dashboard reads this Redis-backed state through `/api/status`. Keep Redis bound to localhost unless you configure authentication and firewall rules.
 
 Manual payout processing is available from the dashboard button or with:
 
@@ -119,13 +119,13 @@ clef --configdir ~/.clef-tkm-egypt \
   --rules clef-pool-rules.js
 ```
 
-5. Start the Egypt node with the external signer and mining/RPC APIs enabled:
+5. Start the Egypt node with mining/RPC APIs enabled:
 
 ```sh
 ./gtkm --egypt --syncmode=full \
   --signer http://127.0.0.1:8550 \
   --http --http.addr 127.0.0.1 --http.port 8545 \
-  --http.api eth,net,web3,miner,randomx \
+  --http.api eth,net,web3,miner,randomx,tkm \
   --mine --miner.etherbase=0xYourPoolWallet
 ```
 
@@ -134,6 +134,7 @@ clef --configdir ~/.clef-tkm-egypt \
 ```json
 {
   "poolWallet": "0xYourPoolWallet",
+  "poolWalletPassword": "your-wallet-password",
   "redisAddr": "127.0.0.1:6379",
   "redisPassword": "",
   "redisDB": 0,
@@ -149,7 +150,7 @@ clef --configdir ~/.clef-tkm-egypt \
 }
 ```
 
-Start the pool after the node and Clef are running:
+Start the pool after the node is running:
 
 ```sh
 go run ./cmd/tkmpool -config config.example.json

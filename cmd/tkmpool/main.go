@@ -30,6 +30,7 @@ type Config struct {
 	NodeRPC                string  `json:"nodeRPC"`
 	WorkMethod             string  `json:"workMethod"`
 	PoolWallet             string  `json:"poolWallet"`
+	PoolWalletPassword     string  `json:"poolWalletPassword"`
 	RedisAddr              string  `json:"redisAddr"`
 	RedisPassword          string  `json:"redisPassword"`
 	RedisDB                int     `json:"redisDB"`
@@ -47,8 +48,10 @@ type Config struct {
 }
 
 type PayoutState struct {
-	Balances map[string]float64 `json:"balances"`
-	Payments []Payment          `json:"payments"`
+	Balances    map[string]float64 `json:"balances"`
+	Payments    []Payment          `json:"payments"`
+	Miners      map[string]Miner   `json:"miners"`
+	TotalShares uint64             `json:"totalShares"`
 }
 
 type Work struct {
@@ -230,9 +233,27 @@ func (p *Pool) applyPayoutStateLocked(state PayoutState) {
 		}
 		p.balances = balances
 	}
-	p.payments = append([]Payment(nil), state.Payments...)
+	p.payments = append([]Payment{}, state.Payments...)
 	for i := range p.payments {
 		p.payments[i].Wallet = normalizeAddress(p.payments[i].Wallet)
+	}
+	if state.Miners != nil {
+		p.miners = make(map[string]*Miner, len(state.Miners))
+		for key, miner := range state.Miners {
+			miner.Wallet = normalizeAddress(miner.Wallet)
+			if !isValidAddress(miner.Wallet) {
+				log.Printf("dropping invalid miner wallet=%s", miner.Wallet)
+				continue
+			}
+			if key == "" {
+				key = minerKey(miner.Wallet, miner.Worker)
+			}
+			m := miner
+			p.miners[key] = &m
+		}
+	}
+	if state.TotalShares > 0 {
+		p.shares.Store(state.TotalShares)
 	}
 }
 
@@ -253,11 +274,18 @@ func (p *Pool) readRedisPayoutState() (PayoutState, bool, error) {
 
 func (p *Pool) savePayoutStateLocked() {
 	state := PayoutState{
-		Balances: make(map[string]float64, len(p.balances)),
-		Payments: append([]Payment(nil), p.payments...),
+		Balances:    make(map[string]float64, len(p.balances)),
+		Payments:    append([]Payment{}, p.payments...),
+		Miners:      make(map[string]Miner, len(p.miners)),
+		TotalShares: p.shares.Load(),
 	}
 	for wallet, balance := range p.balances {
 		state.Balances[wallet] = round(balance)
+	}
+	for key, miner := range p.miners {
+		if miner != nil {
+			state.Miners[key] = *miner
+		}
 	}
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -498,11 +526,15 @@ func parseAuthorize(raw json.RawMessage) (string, string) {
 	return wallet, strings.TrimSpace(worker)
 }
 
+func minerKey(wallet, worker string) string {
+	return wallet + "." + worker
+}
+
 func (p *Pool) touchMiner(wallet, worker string) {
 	if wallet == "" {
 		return
 	}
-	key := wallet + "." + worker
+	key := minerKey(wallet, worker)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	m := p.miners[key]
@@ -511,10 +543,11 @@ func (p *Pool) touchMiner(wallet, worker string) {
 		p.miners[key] = m
 	}
 	m.LastSeen = time.Now()
+	p.savePayoutStateLocked()
 }
 
 func (p *Pool) recordRejectedShare(wallet, worker string) {
-	key := wallet + "." + worker
+	key := minerKey(wallet, worker)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	m := p.miners[key]
@@ -524,6 +557,7 @@ func (p *Pool) recordRejectedShare(wallet, worker string) {
 	}
 	m.LastSeen = time.Now()
 	m.RejectedShares++
+	p.savePayoutStateLocked()
 }
 
 func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage) bool {
@@ -569,7 +603,7 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 		}
 	}
 
-	key := wallet + "." + worker
+	key := minerKey(wallet, worker)
 	p.mu.Lock()
 	m := p.miners[key]
 	if m == nil {
@@ -584,6 +618,7 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	} else {
 		m.RejectedShares++
 	}
+	p.savePayoutStateLocked()
 	p.mu.Unlock()
 
 	if blockAccepted {
@@ -685,6 +720,21 @@ func (p *Pool) pendingBalancesLocked() map[string]float64 {
 	return pending
 }
 
+func (p *Pool) recordPaymentStatuses(payments []Payment, status string) {
+	if len(payments) == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, payment := range payments {
+		payment.Status = status
+		payment.TxHash = ""
+		payment.CreatedAt = time.Now()
+		p.payments = append(p.payments, payment)
+	}
+	p.savePayoutStateLocked()
+}
+
 func (p *Pool) payDue(ctx context.Context) {
 	if !p.paying.CompareAndSwap(false, true) {
 		return
@@ -706,11 +756,13 @@ func (p *Pool) payDue(ctx context.Context) {
 	confirmedBalance, blockNumber, err := p.rpc.ConfirmedBalance(ctx, p.cfg.PoolWallet, p.cfg.PaymentConfirmations)
 	if err != nil {
 		log.Printf("autopay skipped: confirmed pool balance check failed: %v", err)
+		p.recordPaymentStatuses(due, "waiting: confirmed pool balance check failed: "+err.Error())
 		return
 	}
 	spendable := new(big.Int).Sub(confirmedBalance, antdToWeiInt(p.cfg.PayoutReserveAntd))
 	if spendable.Sign() <= 0 {
 		log.Printf("autopay skipped: confirmed pool balance is below reserve block=%d balanceWei=%s reserveAntd=%f", blockNumber, confirmedBalance.String(), p.cfg.PayoutReserveAntd)
+		p.recordPaymentStatuses(due, fmt.Sprintf("waiting: confirmed pool balance below reserve at block %d", blockNumber))
 		return
 	}
 
@@ -718,9 +770,10 @@ func (p *Pool) payDue(ctx context.Context) {
 		amountWei := antdToWeiInt(payment.Amount)
 		if amountWei.Cmp(spendable) > 0 {
 			log.Printf("autopay waiting for confirmed pool balance wallet=%s amountAntd=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
+			p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: insufficient confirmed pool balance at block %d", blockNumber))
 			continue
 		}
-		tx, err := p.rpc.SendPayment(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
+		tx, err := p.rpc.SendPayment(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount, p.cfg.PoolWalletPassword)
 		p.mu.Lock()
 		if err != nil {
 			payment.Status = "failed: " + err.Error()
@@ -777,7 +830,7 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 		balances[k] = round(v)
 	}
 	pendingBalances := p.pendingBalancesLocked()
-	payments := append([]Payment(nil), p.payments...)
+	payments := append([]Payment{}, p.payments...)
 	work := p.work
 	p.mu.RUnlock()
 
@@ -916,7 +969,7 @@ func (r *RPCClient) ConfirmedBalance(ctx context.Context, address string, confir
 	return balance, confirmed, nil
 }
 
-func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd float64) (string, error) {
+func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd float64, passphrase string) (string, error) {
 	from = normalizeAddress(from)
 	to = normalizeAddress(to)
 	if !isValidAddress(from) {
@@ -925,9 +978,13 @@ func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd
 	if !isValidAddress(to) {
 		return "", fmt.Errorf("invalid payout to address %q", to)
 	}
-	valueWei := antdToWeiHex(amountAntd)
+	txArgs := map[string]any{"from": from, "to": to, "value": antdToWeiHex(amountAntd)}
 	var tx string
-	err := r.call(ctx, "eth_sendTransaction", []any{map[string]any{"from": from, "to": to, "value": valueWei}}, &tx)
+	if passphrase != "" {
+		err := r.call(ctx, "tkm_sendTransactionWithPassphrase", []any{txArgs, passphrase}, &tx)
+		return tx, err
+	}
+	err := r.call(ctx, "eth_sendTransaction", []any{txArgs}, &tx)
 	return tx, err
 }
 
@@ -1057,7 +1114,7 @@ const indexHTML = `<!doctype html>
 
     <section class="section panel">
       <h2>Workers</h2>
-      <table><thead><tr><th>Wallet</th><th>Worker</th><th>Accepted</th><th>Rejected</th><th>Last Seen</th></tr></thead><tbody id="miners"></tbody></table>
+      <table><thead><tr><th>Wallet</th><th>Worker</th><th>Accepted</th><th>Rejected</th><th>Round Shares</th><th>Last Seen</th></tr></thead><tbody id="miners"></tbody></table>
     </section>
 
     <section class="section panel">
@@ -1082,10 +1139,10 @@ const indexHTML = `<!doctype html>
       $('minPayout').textContent = s.minPayoutAntd + ' ANTD';
       $('fee').textContent = s.feePercent + '%';
       $('autoPay').innerHTML = s.autoPay ? '<span class="ok">enabled</span>' : '<span class="bad">disabled</span>';
-      $('miners').innerHTML = s.miners.map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '']);
+      $('miners').innerHTML = s.miners.map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, m.roundShares || 0, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '', '']);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       document.getElementById("balances").innerHTML = wallets.map(w => row([w, (s.balances || {})[w] || 0, (s.pendingBalances || {})[w] || 0, (((s.balances || {})[w] || 0) + ((s.pendingBalances || {})[w] || 0)).toFixed(8)])).join("") || row(["No balances yet", "0", "0", "0"]);
-      $('payments').innerHTML = s.payments.map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
+      $('payments').innerHTML = (s.payments || []).map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
     }
     $('refresh').onclick = load;
     $('runPayments').onclick = async () => {
