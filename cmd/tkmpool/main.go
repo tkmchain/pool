@@ -629,7 +629,7 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	if blockAccepted {
 		p.calculateRound(p.cfg.BlockRewardAntd)
 		if p.cfg.AutoPay {
-			go p.payDue(context.Background())
+			go p.payDueWithConfirmations(context.Background(), 0)
 		}
 	}
 	return shareAccepted
@@ -741,6 +741,10 @@ func (p *Pool) recordPaymentStatuses(payments []Payment, status string) {
 }
 
 func (p *Pool) payDue(ctx context.Context) {
+	p.payDueWithConfirmations(ctx, p.cfg.PaymentConfirmations)
+}
+
+func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 	if !p.paying.CompareAndSwap(false, true) {
 		return
 	}
@@ -758,7 +762,7 @@ func (p *Pool) payDue(ctx context.Context) {
 		return
 	}
 
-	confirmedBalance, blockNumber, err := p.rpc.ConfirmedBalance(ctx, p.cfg.PoolWallet, p.cfg.PaymentConfirmations)
+	confirmedBalance, blockNumber, err := p.rpc.ConfirmedBalance(ctx, p.cfg.PoolWallet, confirmations)
 	if err != nil {
 		log.Printf("autopay skipped: confirmed pool balance check failed: %v", err)
 		p.recordPaymentStatuses(due, "waiting: confirmed pool balance check failed: "+err.Error())

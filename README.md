@@ -44,7 +44,7 @@ Use the payout wallet as username. Worker names are supported with
 
 ## Payments
 
-The pool accounts the configured `blockRewardAntd` proportionally when the daemon accepts a submitted block candidate. Balances and payment history are persisted only to Redis. On startup the pool connects to Redis and writes an empty state if the key does not exist, so Redis must be running before the pool starts. Autopay checks the pool wallet balance at `eth_blockNumber - paymentConfirmations` and only sends payouts that fit inside that confirmed balance after `payoutReserveAntd` is kept aside. Payouts are chunked: each transaction sends at most `maxPayoutPerTxAntd`, and if confirmed spendable pool balance is smaller the pool sends the available amount as long as it is at least `minPayoutAntd`. Failed payout transactions are recorded in the payment list and the miner balance is kept for the next run.
+The pool accounts the configured `blockRewardAntd` proportionally when the daemon accepts a submitted block candidate. Balances and payment history are persisted only to Redis. On startup the pool connects to Redis and writes an empty state if the key does not exist, so Redis must be running before the pool starts. Timer autopay checks the pool wallet balance at `eth_blockNumber - paymentConfirmations`. Payouts triggered by a found block use the latest balance immediately. Both paths only send payouts that fit inside the spendable pool balance after `payoutReserveAntd` is kept aside. Payouts are chunked: each transaction sends at most `maxPayoutPerTxAntd`, and if confirmed spendable pool balance is smaller the pool sends the available amount as long as it is at least `minPayoutAntd`. Failed payout transactions are recorded in the payment list and the miner balance is kept for the next run.
 
 Automatic payment broadcasting is disabled by default. To enable it, set `autoPay` to `true`, set `minPayoutAntd` and `maxPayoutPerTxAntd`, and make sure `poolWallet` is a funded hot wallet. For password mode, set `poolWalletPassword`; the pool calls `tkm_sendTransactionWithPassphrase` for each payout transaction, so the wallet is not globally unlocked. If `poolWalletPassword` is empty, use Clef or another node signer with `eth_sendTransaction` instead.
 
@@ -144,7 +144,7 @@ clef --configdir ~/.clef-tkm-egypt \
   "maxPayoutPerTxAntd": 25.0,
   "autoPay": true,
   "paymentIntervalSeconds": 300,
-  "paymentConfirmations": 12,
+  "paymentConfirmations": 0,
   "payoutReserveAntd": 0.1,
   "rpcTimeoutSeconds": 60,
   "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
