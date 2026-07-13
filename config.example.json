@@ -1,10 +1,11 @@
 {
   "poolName": "TKM Public Pool",
-  "listenHTTP": "187.124.217.73:33230",
-  "listenStratum": "0.0.0.0:3333",
+  "listenHTTP": "0.0.0.0:33230",
+  "listenStratum": "0.0.0.0:33330",
   "nodeRPC": "http://127.0.0.1:8545",
   "workMethod": "miner",
   "poolWallet": "0x348b00a3a3c87291539b59aD0Bd1b811e598bE95",
+  "adminPassword": "",
   "poolWalletPassword": "",
   "redisAddr": "127.0.0.1:6379",
   "redisPassword": "",
@@ -20,6 +21,7 @@
   "paymentConfirmations": 0,
   "payoutReserveAntd": 0.1,
   "rpcTimeoutSeconds": 60,
+  "workPollIntervalMs": 250,
   "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 }
 

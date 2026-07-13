@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -31,6 +32,7 @@ type Config struct {
 	WorkMethod             string  `json:"workMethod"`
 	PoolWallet             string  `json:"poolWallet"`
 	PoolWalletPassword     string  `json:"poolWalletPassword"`
+	AdminPassword          string  `json:"adminPassword"`
 	RedisAddr              string  `json:"redisAddr"`
 	RedisPassword          string  `json:"redisPassword"`
 	RedisDB                int     `json:"redisDB"`
@@ -45,6 +47,7 @@ type Config struct {
 	PaymentConfirmations   int     `json:"paymentConfirmations"`
 	PayoutReserveAntd      float64 `json:"payoutReserveAntd"`
 	RPCTimeoutSeconds      int     `json:"rpcTimeoutSeconds"`
+	WorkPollIntervalMs     int     `json:"workPollIntervalMs"`
 	ShareTarget            string  `json:"shareTarget"`
 }
 
@@ -102,8 +105,10 @@ type logThrottle struct {
 }
 
 type stratumSession struct {
-	enc *json.Encoder
-	mu  sync.Mutex
+	enc    *json.Encoder
+	mu     sync.Mutex
+	wallet string
+	worker string
 }
 
 func (s *stratumSession) write(v any) {
@@ -166,6 +171,7 @@ func loadConfig(path string) (Config, error) {
 		PaymentConfirmations:   12,
 		PayoutReserveAntd:      0.1,
 		RPCTimeoutSeconds:      60,
+		WorkPollIntervalMs:     500,
 		ShareTarget:            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	}
 	b, err := os.ReadFile(path)
@@ -186,6 +192,12 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.RPCTimeoutSeconds <= 0 {
 		cfg.RPCTimeoutSeconds = 60
+	}
+	if cfg.WorkPollIntervalMs <= 0 {
+		cfg.WorkPollIntervalMs = 500
+	}
+	if cfg.WorkPollIntervalMs < 100 {
+		cfg.WorkPollIntervalMs = 100
 	}
 	if cfg.WorkMethod == "" {
 		cfg.WorkMethod = "miner"
@@ -409,7 +421,9 @@ func redisReadRESP(reader *bufio.Reader) ([]byte, error) {
 }
 
 func (p *Pool) pollWork(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	interval := time.Duration(p.cfg.WorkPollIntervalMs) * time.Millisecond
+	log.Printf("work polling interval=%s", interval)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		work, err := p.rpc.GetWork(ctx)
@@ -515,6 +529,13 @@ func (p *Pool) handleStratum(conn net.Conn) {
 			p.notifyCurrent(session)
 		case "mining.authorize":
 			wallet, worker = parseAuthorize(req.Params)
+			if wallet != "" {
+				session.mu.Lock()
+				session.wallet = wallet
+				session.worker = worker
+				session.mu.Unlock()
+				log.Printf("miner connected miner=%s", minerLabel(wallet, worker))
+			}
 			p.touchMiner(wallet, worker)
 			session.write(map[string]any{"id": req.ID, "result": wallet != "", "error": nil})
 		case "mining.submit":
@@ -522,7 +543,7 @@ func (p *Pool) handleStratum(conn net.Conn) {
 				session.write(map[string]any{"id": req.ID, "result": false, "error": "unauthorized"})
 				continue
 			}
-			ok := p.submitShare(context.Background(), wallet, worker, req.Params)
+			ok := p.submitShare(context.Background(), wallet, worker, req.Params, session)
 			session.write(map[string]any{"id": req.ID, "result": ok, "error": nil})
 		case "mining.extranonce.subscribe":
 			session.write(map[string]any{"id": req.ID, "result": true, "error": nil})
@@ -552,6 +573,8 @@ func (p *Pool) notify(session *stratumSession, work Work) {
 			work.SeedHash,
 			p.cfg.ShareTarget,
 			true,
+			fmt.Sprintf("0x%x", work.Height),
+			work.Target,
 		},
 	})
 }
@@ -636,6 +659,13 @@ func minerLabel(wallet, worker string) string {
 	return shortWallet(wallet) + "." + worker
 }
 
+func workerOrDash(worker string) string {
+	if strings.TrimSpace(worker) == "" {
+		return "-"
+	}
+	return worker
+}
+
 func (p *Pool) logEvery(key string, interval time.Duration, format string, args ...any) {
 	now := time.Now()
 	p.logMu.Lock()
@@ -657,7 +687,7 @@ func (p *Pool) logEvery(key string, interval time.Duration, format string, args 
 	log.Printf(format, args...)
 }
 
-func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage) bool {
+func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage, session *stratumSession) bool {
 	var params []string
 	_ = json.Unmarshal(raw, &params)
 	p.mu.RLock()
@@ -670,7 +700,10 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 		if len(params) >= 2 {
 			job = params[1]
 		}
-		p.logEvery("stale:"+minerKey(wallet, worker)+":"+job, 10*time.Second, "share stale miner=%s job=%s current=%s", minerLabel(wallet, worker), shortID(job), shortID(currentJob))
+		p.logEvery("stale:"+minerKey(wallet, worker), time.Minute, "stale shares miner=%s job=%s current=%s action=renotify", minerLabel(wallet, worker), shortID(job), shortID(currentJob))
+		if session != nil {
+			p.notify(session, work)
+		}
 		p.recordRejectedShare(wallet, worker)
 		return false
 	}
@@ -690,9 +723,11 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 				var err error
 				blockAccepted, err = p.rpc.SubmitWorkRaw(ctx, nonce, work.SealHash, digest)
 				if err != nil {
-					log.Printf("block submit failed miner=%s err=%v", minerLabel(wallet, worker), err)
+					log.Printf("block submit failed miner=%s height=%d job=%s err=%v", minerLabel(wallet, worker), work.Height, shortID(jobID(work)), err)
 				} else if !blockAccepted {
-					p.logEvery("blockreject:"+minerKey(wallet, worker), 10*time.Second, "block rejected miner=%s nonce=%s", minerLabel(wallet, worker), shortID(nonce))
+					p.logEvery("blockreject:"+minerKey(wallet, worker), 10*time.Second, "block rejected miner=%s height=%d job=%s nonce=%s", minerLabel(wallet, worker), work.Height, shortID(jobID(work)), shortID(nonce))
+				} else {
+					log.Printf("block mined address=%s worker=%s height=%d job=%s nonce=%s", wallet, workerOrDash(worker), work.Height, shortID(jobID(work)), shortID(nonce))
 				}
 			}
 		}
@@ -903,17 +938,34 @@ func (p *Pool) serveHTTP(ctx context.Context) error {
 		w.Header().Set("content-type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(strings.ReplaceAll(indexHTML, "{{POOL_NAME}}", p.cfg.PoolName)))
 	})
+	mux.HandleFunc("/user.html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(strings.ReplaceAll(userHTML, "{{POOL_NAME}}", p.cfg.PoolName)))
+	})
 	mux.HandleFunc("/admin.html", func(w http.ResponseWriter, r *http.Request) {
+		if !p.requireAdmin(w, r) {
+			return
+		}
 		w.Header().Set("content-type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(strings.ReplaceAll(adminHTML, "{{POOL_NAME}}", p.cfg.PoolName)))
 	})
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		p.writeStatus(w)
 	})
+	mux.HandleFunc("/api/user/status", func(w http.ResponseWriter, r *http.Request) {
+		p.writeUserStatus(w, r)
+	})
 	mux.HandleFunc("/api/admin/status", func(w http.ResponseWriter, r *http.Request) {
+		if !p.requireAdmin(w, r) {
+			return
+		}
 		p.writeAdminStatus(w, r)
 	})
 	mux.HandleFunc("/api/payments/run", func(w http.ResponseWriter, r *http.Request) {
+		if !p.requireAdmin(w, r) {
+			return
+		}
+
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -931,6 +983,33 @@ func (p *Pool) serveHTTP(ctx context.Context) error {
 	return server.ListenAndServe()
 }
 
+func (p *Pool) requireAdmin(w http.ResponseWriter, r *http.Request) bool {
+	if p.cfg.AdminPassword == "" {
+		http.Error(w, "admin password is not configured; set adminPassword in config.json", http.StatusServiceUnavailable)
+		return false
+	}
+	_, password, ok := r.BasicAuth()
+	if ok && subtle.ConstantTimeCompare([]byte(password), []byte(p.cfg.AdminPassword)) == 1 {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="TKM Pool Admin"`)
+	http.Error(w, "admin authentication required", http.StatusUnauthorized)
+	return false
+}
+
+func (p *Pool) sessionCountsLocked() (int, int) {
+	connected := len(p.sessions)
+	authorized := 0
+	for session := range p.sessions {
+		session.mu.Lock()
+		if session.wallet != "" {
+			authorized++
+		}
+		session.mu.Unlock()
+	}
+	return connected, authorized
+}
+
 func (p *Pool) writeStatus(w http.ResponseWriter) {
 	p.mu.RLock()
 	miners := make([]Miner, 0, len(p.miners))
@@ -944,25 +1023,90 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 	pendingBalances := p.pendingBalancesLocked()
 	payments := append([]Payment{}, p.payments...)
 	work := p.work
+	connectedSessions, authorizedSessions := p.sessionCountsLocked()
 	p.mu.RUnlock()
 
 	resp := map[string]any{
-		"poolName":        p.cfg.PoolName,
-		"paymentMode":     p.cfg.PaymentMode,
-		"workMethod":      p.cfg.WorkMethod,
-		"autoPay":         p.cfg.AutoPay,
-		"minPayoutAntd":   p.cfg.MinPayoutAntd,
-		"feePercent":      p.cfg.NetworkFeePercent,
-		"stratum":         p.cfg.ListenStratum,
-		"nodeRPC":         p.cfg.NodeRPC,
-		"poolWallet":      p.cfg.PoolWallet,
-		"uptimeSeconds":   int(time.Since(p.started).Seconds()),
-		"totalShares":     p.shares.Load(),
-		"work":            work,
-		"miners":          miners,
-		"balances":        balances,
-		"pendingBalances": pendingBalances,
-		"payments":        payments,
+		"poolName":           p.cfg.PoolName,
+		"paymentMode":        p.cfg.PaymentMode,
+		"workMethod":         p.cfg.WorkMethod,
+		"autoPay":            p.cfg.AutoPay,
+		"minPayoutAntd":      p.cfg.MinPayoutAntd,
+		"feePercent":         p.cfg.NetworkFeePercent,
+		"stratum":            p.cfg.ListenStratum,
+		"nodeRPC":            p.cfg.NodeRPC,
+		"poolWallet":         p.cfg.PoolWallet,
+		"uptimeSeconds":      int(time.Since(p.started).Seconds()),
+		"totalShares":        p.shares.Load(),
+		"connectedSessions":  connectedSessions,
+		"authorizedSessions": authorizedSessions,
+		"workerCount":        len(miners),
+		"work":               work,
+		"miners":             miners,
+		"balances":           balances,
+		"pendingBalances":    pendingBalances,
+		"payments":           payments,
+	}
+	w.Header().Set("content-type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (p *Pool) writeUserStatus(w http.ResponseWriter, r *http.Request) {
+	wallet := normalizeAddress(r.URL.Query().Get("address"))
+	if !isValidAddress(wallet) {
+		http.Error(w, "invalid wallet address", http.StatusBadRequest)
+		return
+	}
+
+	p.mu.RLock()
+	confirmed := round(p.balances[wallet])
+	pendingBalances := p.pendingBalancesLocked()
+	pending := round(pendingBalances[wallet])
+	miners := make([]Miner, 0)
+	var accepted, rejected, roundShares uint64
+	for _, m := range p.miners {
+		if m != nil && strings.EqualFold(m.Wallet, wallet) {
+			miners = append(miners, *m)
+			accepted += m.AcceptedShares
+			rejected += m.RejectedShares
+			roundShares += m.RoundShares
+		}
+	}
+	payments := make([]Payment, 0)
+	var paid, waiting, failed float64
+	for _, payment := range p.payments {
+		if strings.EqualFold(normalizeAddress(payment.Wallet), wallet) {
+			payments = append(payments, payment)
+			switch {
+			case payment.Status == "sent":
+				paid += payment.Amount
+			case strings.HasPrefix(payment.Status, "failed"):
+				failed += payment.Amount
+			default:
+				waiting += payment.Amount
+			}
+		}
+	}
+	work := p.work
+	p.mu.RUnlock()
+
+	resp := map[string]any{
+		"poolName":            p.cfg.PoolName,
+		"wallet":              wallet,
+		"confirmedBalance":    confirmed,
+		"pendingRoundBalance": pending,
+		"totalBalance":        round(confirmed + pending),
+		"totalPaid":           round(paid),
+		"totalWaiting":        round(waiting),
+		"totalFailed":         round(failed),
+		"acceptedShares":      accepted,
+		"rejectedShares":      rejected,
+		"roundShares":         roundShares,
+		"workers":             miners,
+		"payments":            payments,
+		"work":                work,
+		"minPayoutAntd":       p.cfg.MinPayoutAntd,
+		"maxPayoutPerTxAntd":  p.cfg.MaxPayoutPerTxAntd,
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -982,6 +1126,7 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 	payments := append([]Payment{}, p.payments...)
 	work := p.work
 	totalShares := p.shares.Load()
+	connectedSessions, authorizedSessions := p.sessionCountsLocked()
 	p.mu.RUnlock()
 
 	daemonCoinbase := ""
@@ -1036,6 +1181,7 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 		"paymentIntervalSeconds":         p.cfg.PaymentIntervalSeconds,
 		"paymentConfirmations":           p.cfg.PaymentConfirmations,
 		"payoutReserveAntd":              p.cfg.PayoutReserveAntd,
+		"workPollIntervalMs":             p.cfg.WorkPollIntervalMs,
 		"blockRewardAntd":                p.cfg.BlockRewardAntd,
 		"feePercent":                     p.cfg.NetworkFeePercent,
 		"stratum":                        p.cfg.ListenStratum,
@@ -1049,6 +1195,8 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 		"uptimeSeconds":                  int(time.Since(p.started).Seconds()),
 		"totalShares":                    totalShares,
 		"workerCount":                    len(miners),
+		"connectedSessions":              connectedSessions,
+		"authorizedSessions":             authorizedSessions,
 		"balanceCount":                   len(balances),
 		"paymentCount":                   len(payments),
 		"totalConfirmedMinerBalanceAntd": sumFloatMap(balances),
@@ -1306,7 +1454,7 @@ const indexHTML = `<!doctype html>
     th, td { padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
     th { color:var(--muted); font-size:12px; text-transform:uppercase; }
     code { background:#eef2f7; border:1px solid var(--line); border-radius:5px; padding:2px 5px; }
-    button { border:1px solid #0f4ea8; background:var(--blue); color:white; border-radius:6px; padding:9px 12px; font-weight:700; cursor:pointer; }
+    button, a.button { border:1px solid #0f4ea8; background:var(--blue); color:white; border-radius:6px; padding:9px 12px; font-weight:700; cursor:pointer; text-decoration:none; display:inline-block; }
     button:disabled { opacity:.55; cursor:wait; }
     .ok { color:var(--green); font-weight:700; }
     .bad { color:var(--red); font-weight:700; }
@@ -1324,13 +1472,15 @@ const indexHTML = `<!doctype html>
     </div>
     <div class="row">
       <span>Stratum <code id="stratum">loading</code></span>
+      <a class="button" href="/user.html">Miner Lookup</a>
+      <a class="button" href="/admin.html">Admin</a>
       <button id="refresh">Refresh</button>
     </div>
   </header>
   <main>
     <div class="grid">
       <div class="panel metric"><div class="label">Pool Shares</div><div class="value" id="shares">0</div></div>
-      <div class="panel metric"><div class="label">Connected Workers</div><div class="value" id="workers">0</div></div>
+      <div class="panel metric"><div class="label">Connected Miners</div><div class="value" id="workers">0</div></div>
       <div class="panel metric"><div class="label">Current Height</div><div class="value" id="height">0</div></div>
       <div class="panel metric"><div class="label">Payment Method</div><div class="value" id="payment">PROP</div></div>
     </div>
@@ -1381,7 +1531,7 @@ const indexHTML = `<!doctype html>
       const res = await fetch('/api/status');
       const s = await res.json();
       $('shares').textContent = s.totalShares;
-      $('workers').textContent = s.miners.length;
+      $('workers').textContent = (s.authorizedSessions ?? s.connectedSessions ?? s.miners.length);
       $('height').textContent = s.work.height || 0;
       $('payment').textContent = s.paymentMode;
       $('stratum').textContent = s.stratum;
@@ -1405,6 +1555,96 @@ const indexHTML = `<!doctype html>
     };
     load();
     setInterval(load, 15000);
+  </script>
+</body>
+</html>`
+
+const userHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{POOL_NAME}} Miner</title>
+  <style>
+    :root { color-scheme: light; --bg:#f6f8fb; --ink:#141821; --muted:#5b6472; --line:#d8dee8; --panel:#fff; --green:#12715b; --red:#b42318; --blue:#174ea6; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+    header { background:#151922; color:#fff; padding:20px 28px; display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
+    h1 { margin:0; font-size:24px; letter-spacing:0; }
+    main { max-width:1120px; margin:0 auto; padding:24px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; margin-top:16px; }
+    .grid { display:grid; gap:14px; grid-template-columns:repeat(4, minmax(0, 1fr)); }
+    .metric { min-height:104px; }
+    .label { color:var(--muted); font-size:12px; text-transform:uppercase; font-weight:750; }
+    .value { margin-top:8px; font-size:24px; font-weight:780; overflow-wrap:anywhere; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    input { flex:1 1 360px; min-width:240px; border:1px solid var(--line); border-radius:6px; padding:10px 12px; font:inherit; }
+    button, a.button { border:1px solid #0f4ea8; background:var(--blue); color:white; border-radius:6px; padding:10px 12px; font-weight:700; cursor:pointer; text-decoration:none; display:inline-block; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
+    th { color:var(--muted); font-size:12px; text-transform:uppercase; }
+    .muted { color:var(--muted); }
+    .bad { color:var(--red); font-weight:750; }
+    @media (max-width: 820px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } main { padding:16px; } }
+    @media (max-width: 540px) { .grid { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>{{POOL_NAME}} Miner</h1><div class="muted">Wallet balance and payout history</div></div>
+    <div class="row"><a class="button" href="/">Dashboard</a></div>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="row">
+        <input id="address" placeholder="Enter your payout wallet address">
+        <button id="lookup">Lookup</button>
+      </div>
+      <div id="error" class="bad" style="margin-top:10px"></div>
+    </section>
+    <div class="grid">
+      <div class="panel metric"><div class="label">Confirmed</div><div class="value" id="confirmed">0</div></div>
+      <div class="panel metric"><div class="label">Pending Round</div><div class="value" id="pending">0</div></div>
+      <div class="panel metric"><div class="label">Paid</div><div class="value" id="paid">0</div></div>
+      <div class="panel metric"><div class="label">Shares</div><div class="value" id="shares">0</div></div>
+    </div>
+    <section class="panel">
+      <h2>Workers</h2>
+      <table><thead><tr><th>Worker</th><th>Accepted</th><th>Rejected</th><th>Round Shares</th><th>Last Seen</th></tr></thead><tbody id="workers"></tbody></table>
+    </section>
+    <section class="panel">
+      <h2>Payments</h2>
+      <table><thead><tr><th>Amount</th><th>Status</th><th>Transaction</th><th>Created</th></tr></thead><tbody id="payments"></tbody></table>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const money = (v) => (Number(v || 0)).toFixed(8) + ' ANTD';
+    function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
+    function setAddress(value) {
+      const url = new URL(location.href);
+      if (value) url.searchParams.set('address', value); else url.searchParams.delete('address');
+      history.replaceState(null, '', url.toString());
+    }
+    async function load() {
+      const address = $('address').value.trim();
+      $('error').textContent = '';
+      if (!address) return;
+      setAddress(address);
+      const res = await fetch('/api/user/status?address=' + encodeURIComponent(address));
+      if (!res.ok) { $('error').textContent = await res.text(); return; }
+      const s = await res.json();
+      $('confirmed').textContent = money(s.confirmedBalance);
+      $('pending').textContent = money(s.pendingRoundBalance);
+      $('paid').textContent = money(s.totalPaid);
+      $('shares').textContent = String((s.acceptedShares || 0) + ' / ' + (s.rejectedShares || 0));
+      $('workers').innerHTML = (s.workers || []).map(w => row([w.worker || '-', w.acceptedShares, w.rejectedShares, w.roundShares || 0, new Date(w.lastSeen).toLocaleString()])).join('') || row(['No workers found', '', '', '', '']);
+      $('payments').innerHTML = (s.payments || []).slice().reverse().map(p => row([money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payments yet', '', '', '']);
+    }
+    $('lookup').onclick = load;
+    $('address').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+    const initial = new URLSearchParams(location.search).get('address') || '';
+    if (initial) { $('address').value = initial; load(); }
   </script>
 </body>
 </html>`
@@ -1515,8 +1755,8 @@ const adminHTML = `<!doctype html>
       $('redisStatus').innerHTML = s.redis && s.redis.ok ? '<span class="ok">online</span>' : '<span class="bad">offline</span>';
       $('redisBytes').textContent = s.redis && s.redis.ok ? String(s.redis.stateBytes || 0) + ' bytes saved' : ((s.redis && s.redis.error) || '');
       $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
-      $('runtimeRows').innerHTML = kv('HTTP', s.http) + kv('Stratum', s.stratum) + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
-      $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Recent payment records', s.paymentCount);
+      $('runtimeRows').innerHTML = kv('HTTP', s.http) + kv('Stratum', s.stratum) + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Connected miners', s.authorizedSessions ?? s.connectedSessions ?? 0) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
+      $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Recent payment records', s.paymentCount);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       $('balances').innerHTML = wallets.map(w => {
         const confirmed = (s.balances || {})[w] || 0;
