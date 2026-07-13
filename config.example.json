@@ -13,6 +13,7 @@
   "blockRewardAntd": 100.0,
   "networkFeePercent": 1.0,
   "minPayoutAntd": 5.0,
+  "maxPayoutPerTxAntd": 25.0,
   "paymentMode": "PROP",
   "autoPay": true,
   "paymentIntervalSeconds": 300,

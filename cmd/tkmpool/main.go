@@ -38,6 +38,7 @@ type Config struct {
 	BlockRewardAntd        float64 `json:"blockRewardAntd"`
 	NetworkFeePercent      float64 `json:"networkFeePercent"`
 	MinPayoutAntd          float64 `json:"minPayoutAntd"`
+	MaxPayoutPerTxAntd     float64 `json:"maxPayoutPerTxAntd"`
 	PaymentMode            string  `json:"paymentMode"`
 	AutoPay                bool    `json:"autoPay"`
 	PaymentIntervalSeconds int     `json:"paymentIntervalSeconds"`
@@ -150,6 +151,7 @@ func loadConfig(path string) (Config, error) {
 		BlockRewardAntd:        100,
 		NetworkFeePercent:      1,
 		MinPayoutAntd:          5,
+		MaxPayoutPerTxAntd:     25,
 		PaymentMode:            "PROP",
 		PaymentIntervalSeconds: 300,
 		PaymentConfirmations:   12,
@@ -166,6 +168,9 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.PaymentIntervalSeconds <= 0 {
 		cfg.PaymentIntervalSeconds = 300
+	}
+	if cfg.MaxPayoutPerTxAntd <= 0 {
+		cfg.MaxPayoutPerTxAntd = cfg.MinPayoutAntd
 	}
 	if cfg.PaymentConfirmations < 0 {
 		cfg.PaymentConfirmations = 0
@@ -745,7 +750,7 @@ func (p *Pool) payDue(ctx context.Context) {
 	var due []Payment
 	for wallet, balance := range p.balances {
 		if balance >= p.cfg.MinPayoutAntd {
-			due = append(due, Payment{Wallet: wallet, Amount: round(balance), Status: "pending", CreatedAt: time.Now()})
+			due = append(due, Payment{Wallet: wallet, Amount: round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd)), Status: "pending", CreatedAt: time.Now()})
 		}
 	}
 	p.mu.RUnlock()
@@ -769,9 +774,15 @@ func (p *Pool) payDue(ctx context.Context) {
 	for _, payment := range due {
 		amountWei := antdToWeiInt(payment.Amount)
 		if amountWei.Cmp(spendable) > 0 {
-			log.Printf("autopay waiting for confirmed pool balance wallet=%s amountAntd=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
-			p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: insufficient confirmed pool balance at block %d", blockNumber))
-			continue
+			spendableAntd := weiToAntd(spendable)
+			if spendableAntd >= p.cfg.MinPayoutAntd {
+				payment.Amount = round(minFloat(spendableAntd, p.cfg.MaxPayoutPerTxAntd))
+				amountWei = antdToWeiInt(payment.Amount)
+			} else {
+				log.Printf("autopay waiting for confirmed pool balance wallet=%s amountAntd=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
+				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: insufficient confirmed pool balance at block %d", blockNumber))
+				continue
+			}
 		}
 		tx, err := p.rpc.SendPayment(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount, p.cfg.PoolWalletPassword)
 		p.mu.Lock()
@@ -986,6 +997,21 @@ func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd
 	}
 	err := r.call(ctx, "eth_sendTransaction", []any{txArgs}, &tx)
 	return tx, err
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func weiToAntd(wei *big.Int) float64 {
+	if wei == nil {
+		return 0
+	}
+	antd, _ := new(big.Float).Quo(new(big.Float).SetInt(wei), big.NewFloat(1e18)).Float64()
+	return round(antd)
 }
 
 func antdToWeiHex(amount float64) string {
