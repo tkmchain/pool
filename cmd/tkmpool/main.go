@@ -125,6 +125,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	pool.ensurePoolWalletEtherbase(ctx)
+
 	go pool.pollWork(ctx)
 	go pool.paymentLoop(ctx)
 	go func() {
@@ -210,6 +212,34 @@ func NewPool(cfg Config) *Pool {
 	}
 	pool.loadPayoutState()
 	return pool
+}
+
+func (p *Pool) ensurePoolWalletEtherbase(ctx context.Context) {
+	if !isValidAddress(p.cfg.PoolWallet) {
+		log.Printf("pool wallet is not a valid etherbase address wallet=%s", p.cfg.PoolWallet)
+		return
+	}
+	timeout := 10 * time.Second
+	if p.cfg.RPCTimeoutSeconds > 0 && p.cfg.RPCTimeoutSeconds < 10 {
+		timeout = time.Duration(p.cfg.RPCTimeoutSeconds) * time.Second
+	}
+	setCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	coinbase, err := p.rpc.Coinbase(setCtx)
+	if err == nil && strings.EqualFold(normalizeAddress(coinbase), p.cfg.PoolWallet) {
+		log.Printf("daemon etherbase already matches pool wallet wallet=%s", p.cfg.PoolWallet)
+		return
+	}
+	if err != nil {
+		log.Printf("daemon coinbase check failed before setting pool wallet etherbase: %v", err)
+	}
+	ok, err := p.rpc.SetEtherbase(setCtx, p.cfg.PoolWallet)
+	if err != nil || !ok {
+		log.Printf("pool wallet is not configured as daemon etherbase; start gtkm with --miner.etherbase %s or enable miner RPC API for miner_setEtherbase: %v", p.cfg.PoolWallet, err)
+		return
+	}
+	log.Printf("updated daemon etherbase to pool wallet wallet=%s previous=%s", p.cfg.PoolWallet, coinbase)
 }
 
 func (p *Pool) loadPayoutState() {
@@ -813,8 +843,15 @@ func (p *Pool) serveHTTP(ctx context.Context) error {
 		w.Header().Set("content-type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(strings.ReplaceAll(indexHTML, "{{POOL_NAME}}", p.cfg.PoolName)))
 	})
+	mux.HandleFunc("/admin.html", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(strings.ReplaceAll(adminHTML, "{{POOL_NAME}}", p.cfg.PoolName)))
+	})
 	mux.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
 		p.writeStatus(w)
+	})
+	mux.HandleFunc("/api/admin/status", func(w http.ResponseWriter, r *http.Request) {
+		p.writeAdminStatus(w, r)
 	})
 	mux.HandleFunc("/api/payments/run", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -869,6 +906,111 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
+	p.mu.RLock()
+	miners := make([]Miner, 0, len(p.miners))
+	for _, m := range p.miners {
+		miners = append(miners, *m)
+	}
+	balances := make(map[string]float64, len(p.balances))
+	for k, v := range p.balances {
+		balances[k] = round(v)
+	}
+	pendingBalances := p.pendingBalancesLocked()
+	payments := append([]Payment{}, p.payments...)
+	work := p.work
+	totalShares := p.shares.Load()
+	p.mu.RUnlock()
+
+	daemonCoinbase := ""
+	daemonCoinbaseError := ""
+	if coinbase, err := p.rpc.Coinbase(r.Context()); err != nil {
+		daemonCoinbaseError = err.Error()
+	} else {
+		daemonCoinbase = normalizeAddress(coinbase)
+	}
+
+	poolWalletBalance := map[string]any{}
+	if latestWei, latestBlock, err := p.rpc.ConfirmedBalance(r.Context(), p.cfg.PoolWallet, 0); err != nil {
+		poolWalletBalance["latestError"] = err.Error()
+	} else {
+		poolWalletBalance["latestAntd"] = weiToAntd(latestWei)
+		poolWalletBalance["latestBlock"] = latestBlock
+	}
+	if confirmedWei, confirmedBlock, err := p.rpc.ConfirmedBalance(r.Context(), p.cfg.PoolWallet, p.cfg.PaymentConfirmations); err != nil {
+		poolWalletBalance["confirmedError"] = err.Error()
+		poolWalletBalance["confirmedBlock"] = confirmedBlock
+	} else {
+		confirmedAntd := weiToAntd(confirmedWei)
+		spendableAntd := round(confirmedAntd - p.cfg.PayoutReserveAntd)
+		if spendableAntd < 0 {
+			spendableAntd = 0
+		}
+		poolWalletBalance["confirmedAntd"] = confirmedAntd
+		poolWalletBalance["confirmedBlock"] = confirmedBlock
+		poolWalletBalance["spendableAntd"] = spendableAntd
+	}
+
+	redisInfo := map[string]any{
+		"addr":     p.cfg.RedisAddr,
+		"db":       p.cfg.RedisDB,
+		"stateKey": p.cfg.RedisStateKey,
+	}
+	if raw, err := p.redisCommand("GET", p.cfg.RedisStateKey); err != nil {
+		redisInfo["ok"] = false
+		redisInfo["error"] = err.Error()
+	} else {
+		redisInfo["ok"] = true
+		redisInfo["stateBytes"] = len(raw)
+	}
+
+	resp := map[string]any{
+		"poolName":                       p.cfg.PoolName,
+		"paymentMode":                    p.cfg.PaymentMode,
+		"workMethod":                     p.cfg.WorkMethod,
+		"autoPay":                        p.cfg.AutoPay,
+		"minPayoutAntd":                  p.cfg.MinPayoutAntd,
+		"maxPayoutPerTxAntd":             p.cfg.MaxPayoutPerTxAntd,
+		"paymentIntervalSeconds":         p.cfg.PaymentIntervalSeconds,
+		"paymentConfirmations":           p.cfg.PaymentConfirmations,
+		"payoutReserveAntd":              p.cfg.PayoutReserveAntd,
+		"blockRewardAntd":                p.cfg.BlockRewardAntd,
+		"feePercent":                     p.cfg.NetworkFeePercent,
+		"stratum":                        p.cfg.ListenStratum,
+		"http":                           p.cfg.ListenHTTP,
+		"nodeRPC":                        p.cfg.NodeRPC,
+		"poolWallet":                     p.cfg.PoolWallet,
+		"poolWalletPasswordConfigured":   p.cfg.PoolWalletPassword != "",
+		"daemonCoinbase":                 daemonCoinbase,
+		"daemonCoinbaseError":            daemonCoinbaseError,
+		"poolWalletIsDaemonCoinbase":     daemonCoinbase != "" && strings.EqualFold(daemonCoinbase, p.cfg.PoolWallet),
+		"uptimeSeconds":                  int(time.Since(p.started).Seconds()),
+		"totalShares":                    totalShares,
+		"workerCount":                    len(miners),
+		"balanceCount":                   len(balances),
+		"paymentCount":                   len(payments),
+		"totalConfirmedMinerBalanceAntd": sumFloatMap(balances),
+		"totalPendingRoundAntd":          sumFloatMap(pendingBalances),
+		"poolWalletBalance":              poolWalletBalance,
+		"redis":                          redisInfo,
+		"work":                           work,
+		"miners":                         miners,
+		"balances":                       balances,
+		"pendingBalances":                pendingBalances,
+		"payments":                       payments,
+	}
+	w.Header().Set("content-type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func sumFloatMap(values map[string]float64) float64 {
+	var total float64
+	for _, value := range values {
+		total += value
+	}
+	return round(total)
 }
 
 func (r *RPCClient) call(ctx context.Context, method string, params any, result any) error {
@@ -955,6 +1097,26 @@ func (r *RPCClient) BlockNumber(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	return parseUintFlexible(blockHex), nil
+}
+
+func (r *RPCClient) Coinbase(ctx context.Context) (string, error) {
+	var coinbase string
+	if err := r.call(ctx, "eth_coinbase", []any{}, &coinbase); err != nil {
+		return "", err
+	}
+	return normalizeAddress(coinbase), nil
+}
+
+func (r *RPCClient) SetEtherbase(ctx context.Context, address string) (bool, error) {
+	address = normalizeAddress(address)
+	if !isValidAddress(address) {
+		return false, fmt.Errorf("invalid etherbase address %q", address)
+	}
+	var ok bool
+	if err := r.call(ctx, "miner_setEtherbase", []any{address}, &ok); err != nil {
+		return false, err
+	}
+	return ok, nil
 }
 
 func (r *RPCClient) ConfirmedBalance(ctx context.Context, address string, confirmations int) (*big.Int, uint64, error) {
@@ -1173,6 +1335,136 @@ const indexHTML = `<!doctype html>
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       document.getElementById("balances").innerHTML = wallets.map(w => row([w, (s.balances || {})[w] || 0, (s.pendingBalances || {})[w] || 0, (((s.balances || {})[w] || 0) + ((s.pendingBalances || {})[w] || 0)).toFixed(8)])).join("") || row(["No balances yet", "0", "0", "0"]);
       $('payments').innerHTML = (s.payments || []).map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
+    }
+    $('refresh').onclick = load;
+    $('runPayments').onclick = async () => {
+      $('runPayments').disabled = true;
+      await fetch('/api/payments/run', { method: 'POST' });
+      $('runPayments').disabled = false;
+      load();
+    };
+    load();
+    setInterval(load, 15000);
+  </script>
+</body>
+</html>`
+
+const adminHTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{POOL_NAME}} Admin</title>
+  <style>
+    :root { color-scheme: light; --bg:#f5f7fb; --ink:#141821; --muted:#5b6472; --line:#d8dee8; --panel:#fff; --green:#12715b; --red:#b42318; --blue:#174ea6; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
+    header { background:#151922; color:#fff; padding:20px 28px; display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
+    h1 { margin:0; font-size:24px; letter-spacing:0; }
+    main { max-width:1260px; margin:0 auto; padding:24px; }
+    .grid { display:grid; gap:14px; grid-template-columns:repeat(4, minmax(0, 1fr)); }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    .metric { min-height:112px; }
+    .label { color:var(--muted); font-size:12px; text-transform:uppercase; font-weight:750; }
+    .value { margin-top:8px; font-size:24px; font-weight:780; overflow-wrap:anywhere; }
+    .section { margin-top:18px; }
+    .section h2 { margin:0 0 12px; font-size:17px; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
+    th { color:var(--muted); font-size:12px; text-transform:uppercase; }
+    code { background:#eef2f7; border:1px solid var(--line); border-radius:5px; padding:2px 5px; }
+    button, a.button { border:1px solid #0f4ea8; background:var(--blue); color:white; border-radius:6px; padding:9px 12px; font-weight:700; cursor:pointer; text-decoration:none; display:inline-block; }
+    button:disabled { opacity:.55; cursor:wait; }
+    .ok { color:var(--green); font-weight:750; }
+    .bad { color:var(--red); font-weight:750; }
+    .muted { color:var(--muted); }
+    .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .split { display:grid; gap:14px; grid-template-columns:1fr 1fr; }
+    @media (max-width: 920px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } .split { grid-template-columns:1fr; } main { padding:16px; } }
+    @media (max-width: 560px) { .grid { grid-template-columns:1fr; } header { padding:18px; } .value { font-size:20px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>{{POOL_NAME}} Admin</h1>
+      <div class="muted">Pool operations and payout state</div>
+    </div>
+    <div class="row">
+      <a class="button" href="/">Dashboard</a>
+      <button id="refresh">Refresh</button>
+      <button id="runPayments">Run Payments</button>
+    </div>
+  </header>
+  <main>
+    <div class="grid">
+      <div class="panel metric"><div class="label">Pool Wallet Latest</div><div class="value" id="latestBalance">loading</div><div class="muted" id="latestBlock"></div></div>
+      <div class="panel metric"><div class="label">Confirmed Spendable</div><div class="value" id="spendableBalance">loading</div><div class="muted" id="confirmedBlock"></div></div>
+      <div class="panel metric"><div class="label">Miner Balance Owed</div><div class="value" id="owedBalance">0</div><div class="muted" id="pendingBalance"></div></div>
+      <div class="panel metric"><div class="label">Redis State</div><div class="value" id="redisStatus">loading</div><div class="muted" id="redisBytes"></div></div>
+    </div>
+
+    <section class="section split">
+      <div class="panel">
+        <h2>Pool Wallet</h2>
+        <table><tbody id="walletRows"></tbody></table>
+      </div>
+      <div class="panel">
+        <h2>Runtime</h2>
+        <table><tbody id="runtimeRows"></tbody></table>
+      </div>
+    </section>
+
+    <section class="section panel">
+      <h2>Payout Configuration</h2>
+      <table><tbody id="payoutRows"></tbody></table>
+    </section>
+
+    <section class="section panel">
+      <h2>Miner Balances</h2>
+      <table><thead><tr><th>Wallet</th><th>Confirmed ANTD</th><th>Pending Round ANTD</th><th>Total ANTD</th></tr></thead><tbody id="balances"></tbody></table>
+    </section>
+
+    <section class="section panel">
+      <h2>Workers</h2>
+      <table><thead><tr><th>Wallet</th><th>Worker</th><th>Accepted</th><th>Rejected</th><th>Round Shares</th><th>Last Seen</th></tr></thead><tbody id="miners"></tbody></table>
+    </section>
+
+    <section class="section panel">
+      <h2>Recent Payouts</h2>
+      <table><thead><tr><th>Wallet</th><th>Amount</th><th>Status</th><th>Transaction</th><th>Created</th></tr></thead><tbody id="payments"></tbody></table>
+    </section>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const money = (v) => (Number(v || 0)).toFixed(8) + ' ANTD';
+    const yesno = (v) => v ? '<span class="ok">yes</span>' : '<span class="bad">no</span>';
+    function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
+    function kv(k, v) { return '<tr><th>' + k + '</th><td>' + String(v ?? '') + '</td></tr>'; }
+    function errText(v) { return v ? '<span class="bad">' + String(v) + '</span>' : ''; }
+    async function load() {
+      const res = await fetch('/api/admin/status');
+      const s = await res.json();
+      const b = s.poolWalletBalance || {};
+      $('latestBalance').innerHTML = b.latestError ? errText(b.latestError) : money(b.latestAntd);
+      $('latestBlock').textContent = b.latestBlock !== undefined ? 'block ' + b.latestBlock : '';
+      $('spendableBalance').innerHTML = b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd);
+      $('confirmedBlock').textContent = b.confirmedBlock !== undefined ? 'confirmed block ' + b.confirmedBlock : '';
+      $('owedBalance').textContent = money(s.totalConfirmedMinerBalanceAntd);
+      $('pendingBalance').textContent = 'pending round ' + money(s.totalPendingRoundAntd);
+      $('redisStatus').innerHTML = s.redis && s.redis.ok ? '<span class="ok">online</span>' : '<span class="bad">offline</span>';
+      $('redisBytes').textContent = s.redis && s.redis.ok ? String(s.redis.stateBytes || 0) + ' bytes saved' : ((s.redis && s.redis.error) || '');
+      $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
+      $('runtimeRows').innerHTML = kv('HTTP', s.http) + kv('Stratum', s.stratum) + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
+      $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Recent payment records', s.paymentCount);
+      const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
+      $('balances').innerHTML = wallets.map(w => {
+        const confirmed = (s.balances || {})[w] || 0;
+        const pending = (s.pendingBalances || {})[w] || 0;
+        return row([w, money(confirmed), money(pending), money(confirmed + pending)]);
+      }).join('') || row(['No balances yet', money(0), money(0), money(0)]);
+      $('miners').innerHTML = (s.miners || []).map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, m.roundShares || 0, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '', '']);
+      $('payments').innerHTML = (s.payments || []).slice().reverse().slice(0, 50).map(p => row([p.wallet, money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payouts yet', '', '', '', '']);
     }
     $('refresh').onclick = load;
     $('runPayments').onclick = async () => {
