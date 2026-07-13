@@ -89,9 +89,16 @@ type Pool struct {
 	payments []Payment
 	jobs     map[string]Work
 	sessions map[*stratumSession]struct{}
+	logMu    sync.Mutex
+	lastLog  map[string]logThrottle
 	started  time.Time
 	shares   atomic.Uint64
 	paying   atomic.Bool
+}
+
+type logThrottle struct {
+	last       time.Time
+	suppressed int
 }
 
 type stratumSession struct {
@@ -208,6 +215,7 @@ func NewPool(cfg Config) *Pool {
 		balances: make(map[string]float64),
 		jobs:     make(map[string]Work),
 		sessions: make(map[*stratumSession]struct{}),
+		lastLog:  make(map[string]logThrottle),
 		started:  time.Now(),
 	}
 	pool.loadPayoutState()
@@ -419,6 +427,9 @@ func (p *Pool) pollWork(ctx context.Context) {
 				}
 			}
 			p.mu.Unlock()
+			if changed {
+				log.Printf("new work height=%d job=%s target=%s miners=%d", work.Height, shortID(jobID(work)), shortID(work.Target), len(sessions))
+			}
 			for _, session := range sessions {
 				p.notify(session, work)
 			}
@@ -595,6 +606,53 @@ func (p *Pool) recordRejectedShare(wallet, worker string) {
 	p.savePayoutStateLocked()
 }
 
+func shortID(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 18 {
+		return value
+	}
+	if strings.HasPrefix(value, "0x") && len(value) > 18 {
+		return value[:10] + ".." + value[len(value)-6:]
+	}
+	return value[:8] + ".." + value[len(value)-6:]
+}
+
+func shortWallet(wallet string) string {
+	wallet = normalizeAddress(wallet)
+	if len(wallet) == 42 {
+		return wallet[:8] + ".." + wallet[len(wallet)-4:]
+	}
+	return shortID(wallet)
+}
+
+func minerLabel(wallet, worker string) string {
+	if worker == "" {
+		return shortWallet(wallet)
+	}
+	return shortWallet(wallet) + "." + worker
+}
+
+func (p *Pool) logEvery(key string, interval time.Duration, format string, args ...any) {
+	now := time.Now()
+	p.logMu.Lock()
+	entry := p.lastLog[key]
+	if !entry.last.IsZero() && now.Sub(entry.last) < interval {
+		entry.suppressed++
+		p.lastLog[key] = entry
+		p.logMu.Unlock()
+		return
+	}
+	suppressed := entry.suppressed
+	p.lastLog[key] = logThrottle{last: now}
+	p.logMu.Unlock()
+
+	if suppressed > 0 {
+		format += " repeated=%d"
+		args = append(args, suppressed)
+	}
+	log.Printf(format, args...)
+}
+
 func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage) bool {
 	var params []string
 	_ = json.Unmarshal(raw, &params)
@@ -610,7 +668,7 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	}
 	p.mu.RUnlock()
 	if staleJob {
-		log.Printf("stale share rejected wallet=%s worker=%s job=%s", wallet, worker, params[1])
+		p.logEvery("stale:"+minerKey(wallet, worker)+":"+params[1], 10*time.Second, "share stale miner=%s job=%s", minerLabel(wallet, worker), shortID(params[1]))
 		p.recordRejectedShare(wallet, worker)
 		return false
 	}
@@ -624,15 +682,15 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 			if digestMeetsTarget(digest, p.cfg.ShareTarget) {
 				shareAccepted = true
 			} else {
-				log.Printf("share below pool target wallet=%s worker=%s nonce=%s", wallet, worker, nonce)
+				p.logEvery("lowdiff:"+minerKey(wallet, worker), 10*time.Second, "share low-diff miner=%s nonce=%s", minerLabel(wallet, worker), shortID(nonce))
 			}
 			if shareAccepted && digestMeetsTarget(digest, work.Target) {
 				var err error
 				blockAccepted, err = p.rpc.SubmitWorkRaw(ctx, nonce, work.SealHash, digest)
 				if err != nil {
-					log.Printf("block candidate submit failed wallet=%s worker=%s err=%v", wallet, worker, err)
+					log.Printf("block submit failed miner=%s err=%v", minerLabel(wallet, worker), err)
 				} else if !blockAccepted {
-					log.Printf("block candidate rejected by daemon wallet=%s worker=%s nonce=%s", wallet, worker, nonce)
+					p.logEvery("blockreject:"+minerKey(wallet, worker), 10*time.Second, "block rejected miner=%s nonce=%s", minerLabel(wallet, worker), shortID(nonce))
 				}
 			}
 		}
