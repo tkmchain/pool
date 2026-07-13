@@ -420,7 +420,11 @@ func (p *Pool) pollWork(ctx context.Context) {
 			p.mu.Lock()
 			changed := p.work.SealHash != work.SealHash
 			p.work = work
-			p.jobs[jobID(work)] = work
+			if changed {
+				p.jobs = map[string]Work{jobID(work): work}
+			} else {
+				p.jobs[jobID(work)] = work
+			}
 			if changed {
 				for session := range p.sessions {
 					sessions = append(sessions, session)
@@ -658,17 +662,15 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	_ = json.Unmarshal(raw, &params)
 	p.mu.RLock()
 	work := p.work
-	staleJob := false
-	if len(params) >= 2 {
-		if job, ok := p.jobs[params[1]]; ok {
-			work = job
-		} else {
-			staleJob = true
-		}
-	}
+	currentJob := jobID(work)
+	staleJob := len(params) < 2 || params[1] == "" || params[1] != currentJob
 	p.mu.RUnlock()
 	if staleJob {
-		p.logEvery("stale:"+minerKey(wallet, worker)+":"+params[1], 10*time.Second, "share stale miner=%s job=%s", minerLabel(wallet, worker), shortID(params[1]))
+		job := ""
+		if len(params) >= 2 {
+			job = params[1]
+		}
+		p.logEvery("stale:"+minerKey(wallet, worker)+":"+job, 10*time.Second, "share stale miner=%s job=%s current=%s", minerLabel(wallet, worker), shortID(job), shortID(currentJob))
 		p.recordRejectedShare(wallet, worker)
 		return false
 	}
