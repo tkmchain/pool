@@ -91,7 +91,7 @@ function ApproveListing() {
 function ApproveTx(req) {
   var tx = req.transaction;
   var pool = "0xyourpoolwallet";
-  var maxWei = BigInt("100000000000000000000"); // 100 ANTD
+  var maxWei = BigInt("100000000000000000000"); // 100 TKM
 
   if (!tx.from || tx.from.toLowerCase() !== pool) {
     return "Reject";

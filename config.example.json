@@ -22,6 +22,8 @@
   "payoutReserveAntd": 0.1,
   "rpcTimeoutSeconds": 60,
   "workPollIntervalMs": 250,
-  "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "publicURL": "http://127.0.0.1:33230",
+  "explorerURL": "https://block.tkmchain.site",
+  "publicStratum": "127.0.0.1:33330"
 }
-

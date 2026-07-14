@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -27,7 +28,10 @@ import (
 type Config struct {
 	PoolName               string  `json:"poolName"`
 	ListenHTTP             string  `json:"listenHTTP"`
+	PublicURL              string  `json:"publicURL"`
+	ExplorerURL            string  `json:"explorerURL"`
 	ListenStratum          string  `json:"listenStratum"`
+	PublicStratum          string  `json:"publicStratum"`
 	NodeRPC                string  `json:"nodeRPC"`
 	WorkMethod             string  `json:"workMethod"`
 	PoolWallet             string  `json:"poolWallet"`
@@ -148,7 +152,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("%s dashboard listening on http://%s", cfg.PoolName, cfg.ListenHTTP)
+	log.Printf("%s dashboard listening on %s bind=%s", cfg.PoolName, cfg.PublicURL, cfg.ListenHTTP)
 	if err := pool.serveHTTP(ctx); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -158,7 +162,10 @@ func loadConfig(path string) (Config, error) {
 	cfg := Config{
 		PoolName:               "TKM Pool",
 		ListenHTTP:             "127.0.0.1:8080",
+		PublicURL:              "http://127.0.0.1:8080",
+		ExplorerURL:            "",
 		ListenStratum:          "0.0.0.0:3333",
+		PublicStratum:          "127.0.0.1:3333",
 		NodeRPC:                "http://127.0.0.1:8545",
 		WorkMethod:             "miner",
 		RedisStateKey:          "tkmpool:payout-state",
@@ -180,6 +187,24 @@ func loadConfig(path string) (Config, error) {
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return cfg, err
+	}
+	if strings.HasPrefix(strings.ToLower(cfg.ListenHTTP), "http://") || strings.HasPrefix(strings.ToLower(cfg.ListenHTTP), "https://") {
+		if cfg.PublicURL == "" {
+			cfg.PublicURL = cfg.ListenHTTP
+		}
+		if parsed, err := url.Parse(cfg.ListenHTTP); err == nil && parsed.Port() != "" {
+			cfg.ListenHTTP = "0.0.0.0:" + parsed.Port()
+		} else {
+			cfg.ListenHTTP = "0.0.0.0:33230"
+		}
+	}
+	if cfg.PublicURL == "" {
+		cfg.PublicURL = "http://" + cfg.ListenHTTP
+	}
+	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
+	cfg.ExplorerURL = strings.TrimRight(cfg.ExplorerURL, "/")
+	if cfg.PublicStratum == "" {
+		cfg.PublicStratum = cfg.ListenStratum
 	}
 	if cfg.PaymentIntervalSeconds <= 0 {
 		cfg.PaymentIntervalSeconds = 300
@@ -466,7 +491,7 @@ func (p *Pool) serveStratum(ctx context.Context) error {
 		return err
 	}
 	defer ln.Close()
-	log.Printf("stratum listening on %s", p.cfg.ListenStratum)
+	log.Printf("stratum listening on %s public=%s", p.cfg.ListenStratum, p.cfg.PublicStratum)
 
 	go func() {
 		<-ctx.Done()
@@ -895,7 +920,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 	}
 	spendable := new(big.Int).Sub(confirmedBalance, antdToWeiInt(p.cfg.PayoutReserveAntd))
 	if spendable.Sign() <= 0 {
-		log.Printf("autopay skipped: confirmed pool balance is below reserve block=%d balanceWei=%s reserveAntd=%f", blockNumber, confirmedBalance.String(), p.cfg.PayoutReserveAntd)
+		log.Printf("autopay skipped: confirmed pool balance is below reserve block=%d balanceWei=%s reserveTkm=%f", blockNumber, confirmedBalance.String(), p.cfg.PayoutReserveAntd)
 		p.recordPaymentStatuses(due, fmt.Sprintf("waiting: confirmed pool balance below reserve at block %d", blockNumber))
 		return
 	}
@@ -908,7 +933,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 				payment.Amount = round(minFloat(spendableAntd, p.cfg.MaxPayoutPerTxAntd))
 				amountWei = antdToWeiInt(payment.Amount)
 			} else {
-				log.Printf("autopay waiting for confirmed pool balance wallet=%s amountAntd=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
+				log.Printf("autopay waiting for confirmed pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
 				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: insufficient confirmed pool balance at block %d", blockNumber))
 				continue
 			}
@@ -1033,7 +1058,11 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 		"autoPay":            p.cfg.AutoPay,
 		"minPayoutAntd":      p.cfg.MinPayoutAntd,
 		"feePercent":         p.cfg.NetworkFeePercent,
-		"stratum":            p.cfg.ListenStratum,
+		"stratum":            p.cfg.PublicStratum,
+		"stratumBind":        p.cfg.ListenStratum,
+		"http":               p.cfg.ListenHTTP,
+		"publicURL":          p.cfg.PublicURL,
+		"explorerURL":        p.cfg.ExplorerURL,
 		"nodeRPC":            p.cfg.NodeRPC,
 		"poolWallet":         p.cfg.PoolWallet,
 		"uptimeSeconds":      int(time.Since(p.started).Seconds()),
@@ -1104,6 +1133,7 @@ func (p *Pool) writeUserStatus(w http.ResponseWriter, r *http.Request) {
 		"roundShares":         roundShares,
 		"workers":             miners,
 		"payments":            payments,
+		"explorerURL":         p.cfg.ExplorerURL,
 		"work":                work,
 		"minPayoutAntd":       p.cfg.MinPayoutAntd,
 		"maxPayoutPerTxAntd":  p.cfg.MaxPayoutPerTxAntd,
@@ -1184,8 +1214,11 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 		"workPollIntervalMs":             p.cfg.WorkPollIntervalMs,
 		"blockRewardAntd":                p.cfg.BlockRewardAntd,
 		"feePercent":                     p.cfg.NetworkFeePercent,
-		"stratum":                        p.cfg.ListenStratum,
+		"stratum":                        p.cfg.PublicStratum,
+		"stratumBind":                    p.cfg.ListenStratum,
 		"http":                           p.cfg.ListenHTTP,
+		"publicURL":                      p.cfg.PublicURL,
+		"explorerURL":                    p.cfg.ExplorerURL,
 		"nodeRPC":                        p.cfg.NodeRPC,
 		"poolWallet":                     p.cfg.PoolWallet,
 		"poolWalletPasswordConfigured":   p.cfg.PoolWalletPassword != "",
@@ -1512,7 +1545,7 @@ const indexHTML = `<!doctype html>
         </tbody>
       </table>
       <h2 style="margin-top:18px">Balances</h2>
-      <table><thead><tr><th>Wallet</th><th>Confirmed ANTD</th><th>Pending Round ANTD</th><th>Total ANTD</th></tr></thead><tbody id="balances"></tbody></table>
+      <table><thead><tr><th>Wallet</th><th>Confirmed TKM</th><th>Pending Round TKM</th><th>Total TKM</th></tr></thead><tbody id="balances"></tbody></table>
     </section>
 
     <section class="section panel">
@@ -1532,12 +1565,15 @@ const indexHTML = `<!doctype html>
     let paymentsPage = 0;
     let paymentsRows = [];
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
+    const money = (v) => (Number(v || 0)).toFixed(8) + ' TKM';
+    function txLink(hash) { return hash && explorerURL ? '<a href="' + explorerURL + '/tx/' + hash + '" target="_blank" rel="noopener">' + hash + '</a>' : (hash || '-'); }
+    let explorerURL = '';
     function renderPayments() {
       const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
       paymentsPage = Math.min(Math.max(0, paymentsPage), totalPages - 1);
       const start = paymentsPage * paymentsPageSize;
       const visible = paymentsRows.slice(start, start + paymentsPageSize);
-      $('payments').innerHTML = visible.map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
+      $('payments').innerHTML = visible.map(p => row([p.wallet, money(p.amountAntd), p.status, txLink(p.txHash)])).join('') || row(['No payouts yet', '', '', '']);
       $('paymentsPage').textContent = 'Page ' + (paymentsPage + 1) + ' of ' + totalPages + ' (' + paymentsRows.length + ' payouts)';
       $('paymentsPrev').disabled = paymentsPage <= 0;
       $('paymentsNext').disabled = paymentsPage >= totalPages - 1;
@@ -1552,13 +1588,14 @@ const indexHTML = `<!doctype html>
       $('stratum').textContent = s.stratum;
       $('minerUrl').textContent = 'stratum+tcp://' + s.stratum;
       $('poolWallet').textContent = s.poolWallet;
+      explorerURL = s.explorerURL || '';
       $('payMode').textContent = s.paymentMode + ' proportional accepted-share accounting';
-      $('minPayout').textContent = s.minPayoutAntd + ' ANTD';
+      $('minPayout').textContent = s.minPayoutAntd + ' TKM';
       $('fee').textContent = s.feePercent + '%';
       $('autoPay').innerHTML = s.autoPay ? '<span class="ok">enabled</span>' : '<span class="bad">disabled</span>';
       $('miners').innerHTML = s.miners.map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, m.roundShares || 0, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '', '']);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
-      document.getElementById("balances").innerHTML = wallets.map(w => row([w, (s.balances || {})[w] || 0, (s.pendingBalances || {})[w] || 0, (((s.balances || {})[w] || 0) + ((s.pendingBalances || {})[w] || 0)).toFixed(8)])).join("") || row(["No balances yet", "0", "0", "0"]);
+      document.getElementById("balances").innerHTML = wallets.map(w => row([w, money((s.balances || {})[w] || 0), money((s.pendingBalances || {})[w] || 0), money(((s.balances || {})[w] || 0) + ((s.pendingBalances || {})[w] || 0))])).join("") || row(["No balances yet", money(0), money(0), money(0)]);
       paymentsRows = (s.payments || []).slice().reverse();
       renderPayments();
     }
@@ -1639,17 +1676,19 @@ const userHTML = `<!doctype html>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    const money = (v) => (Number(v || 0)).toFixed(8) + ' ANTD';
+    const money = (v) => (Number(v || 0)).toFixed(8) + ' TKM';
     const paymentsPageSize = 25;
     let paymentsPage = 0;
     let paymentsRows = [];
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
+    function txLink(hash) { return hash && explorerURL ? '<a href="' + explorerURL + '/tx/' + hash + '" target="_blank" rel="noopener">' + hash + '</a>' : (hash || '-'); }
+    let explorerURL = '';
     function renderPayments() {
       const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
       paymentsPage = Math.min(Math.max(0, paymentsPage), totalPages - 1);
       const start = paymentsPage * paymentsPageSize;
       const visible = paymentsRows.slice(start, start + paymentsPageSize);
-      $('payments').innerHTML = visible.map(p => row([money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payments yet', '', '', '']);
+      $('payments').innerHTML = visible.map(p => row([money(p.amountAntd), p.status, txLink(p.txHash), new Date(p.createdAt).toLocaleString()])).join('') || row(['No payments yet', '', '', '']);
       $('paymentsPage').textContent = 'Page ' + (paymentsPage + 1) + ' of ' + totalPages + ' (' + paymentsRows.length + ' payments)';
       $('paymentsPrev').disabled = paymentsPage <= 0;
       $('paymentsNext').disabled = paymentsPage >= totalPages - 1;
@@ -1667,6 +1706,7 @@ const userHTML = `<!doctype html>
       const res = await fetch('/api/user/status?address=' + encodeURIComponent(address));
       if (!res.ok) { $('error').textContent = await res.text(); return; }
       const s = await res.json();
+      explorerURL = s.explorerURL || '';
       $('confirmed').textContent = money(s.confirmedBalance);
       $('pending').textContent = money(s.pendingRoundBalance);
       $('paid').textContent = money(s.totalPaid);
@@ -1759,7 +1799,7 @@ const adminHTML = `<!doctype html>
 
     <section class="section panel">
       <h2>Miner Balances</h2>
-      <table><thead><tr><th>Wallet</th><th>Confirmed ANTD</th><th>Pending Round ANTD</th><th>Total ANTD</th></tr></thead><tbody id="balances"></tbody></table>
+      <table><thead><tr><th>Wallet</th><th>Confirmed TKM</th><th>Pending Round TKM</th><th>Total TKM</th></tr></thead><tbody id="balances"></tbody></table>
     </section>
 
     <section class="section panel">
@@ -1775,12 +1815,14 @@ const adminHTML = `<!doctype html>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    const money = (v) => (Number(v || 0)).toFixed(8) + ' ANTD';
+    const money = (v) => (Number(v || 0)).toFixed(8) + ' TKM';
     const paymentsPageSize = 25;
     let paymentsPage = 0;
     let paymentsRows = [];
     const yesno = (v) => v ? '<span class="ok">yes</span>' : '<span class="bad">no</span>';
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
+    function txLink(hash) { return hash && explorerURL ? '<a href="' + explorerURL + '/tx/' + hash + '" target="_blank" rel="noopener">' + hash + '</a>' : (hash || '-'); }
+    let explorerURL = '';
     function kv(k, v) { return '<tr><th>' + k + '</th><td>' + String(v ?? '') + '</td></tr>'; }
     function errText(v) { return v ? '<span class="bad">' + String(v) + '</span>' : ''; }
     function renderPayments() {
@@ -1788,7 +1830,7 @@ const adminHTML = `<!doctype html>
       paymentsPage = Math.min(Math.max(0, paymentsPage), totalPages - 1);
       const start = paymentsPage * paymentsPageSize;
       const visible = paymentsRows.slice(start, start + paymentsPageSize);
-      $('payments').innerHTML = visible.map(p => row([p.wallet, money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payouts yet', '', '', '', '']);
+      $('payments').innerHTML = visible.map(p => row([p.wallet, money(p.amountAntd), p.status, txLink(p.txHash), new Date(p.createdAt).toLocaleString()])).join('') || row(['No payouts yet', '', '', '', '']);
       $('paymentsPage').textContent = 'Page ' + (paymentsPage + 1) + ' of ' + totalPages + ' (' + paymentsRows.length + ' payouts)';
       $('paymentsPrev').disabled = paymentsPage <= 0;
       $('paymentsNext').disabled = paymentsPage >= totalPages - 1;
@@ -1796,6 +1838,7 @@ const adminHTML = `<!doctype html>
     async function load() {
       const res = await fetch('/api/admin/status');
       const s = await res.json();
+      explorerURL = s.explorerURL || '';
       const b = s.poolWalletBalance || {};
       $('latestBalance').innerHTML = b.latestError ? errText(b.latestError) : money(b.latestAntd);
       $('latestBlock').textContent = b.latestBlock !== undefined ? 'block ' + b.latestBlock : '';
@@ -1806,7 +1849,7 @@ const adminHTML = `<!doctype html>
       $('redisStatus').innerHTML = s.redis && s.redis.ok ? '<span class="ok">online</span>' : '<span class="bad">offline</span>';
       $('redisBytes').textContent = s.redis && s.redis.ok ? String(s.redis.stateBytes || 0) + ' bytes saved' : ((s.redis && s.redis.error) || '');
       $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
-      $('runtimeRows').innerHTML = kv('HTTP', s.http) + kv('Stratum', s.stratum) + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Connected miners', s.authorizedSessions ?? s.connectedSessions ?? 0) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
+      $('runtimeRows').innerHTML = kv('Public URL', s.publicURL) + kv('HTTP bind', s.http) + kv('Stratum public', s.stratum) + kv('Stratum bind', s.stratumBind) + kv('Explorer', s.explorerURL || '-') + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Connected miners', s.authorizedSessions ?? s.connectedSessions ?? 0) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
       $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Recent payment records', s.paymentCount);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       $('balances').innerHTML = wallets.map(w => {
