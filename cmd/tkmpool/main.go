@@ -1460,6 +1460,7 @@ const indexHTML = `<!doctype html>
     .bad { color:var(--red); font-weight:700; }
     .muted { color:var(--muted); }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .pager { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; flex-wrap:wrap; }
     @media (max-width: 860px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } main { padding:16px; } }
     @media (max-width: 560px) { .grid { grid-template-columns:1fr; } header { padding:18px; } .value { font-size:20px; } }
   </style>
@@ -1522,11 +1523,25 @@ const indexHTML = `<!doctype html>
     <section class="section panel">
       <h2>Recent Payouts</h2>
       <table><thead><tr><th>Wallet</th><th>Amount</th><th>Status</th><th>Transaction</th></tr></thead><tbody id="payments"></tbody></table>
+      <div class="pager"><button id="paymentsPrev">Previous</button><span id="paymentsPage" class="muted">Page 1 of 1</span><button id="paymentsNext">Next</button></div>
     </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
+    const paymentsPageSize = 25;
+    let paymentsPage = 0;
+    let paymentsRows = [];
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
+    function renderPayments() {
+      const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
+      paymentsPage = Math.min(Math.max(0, paymentsPage), totalPages - 1);
+      const start = paymentsPage * paymentsPageSize;
+      const visible = paymentsRows.slice(start, start + paymentsPageSize);
+      $('payments').innerHTML = visible.map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
+      $('paymentsPage').textContent = 'Page ' + (paymentsPage + 1) + ' of ' + totalPages + ' (' + paymentsRows.length + ' payouts)';
+      $('paymentsPrev').disabled = paymentsPage <= 0;
+      $('paymentsNext').disabled = paymentsPage >= totalPages - 1;
+    }
     async function load() {
       const res = await fetch('/api/status');
       const s = await res.json();
@@ -1544,8 +1559,11 @@ const indexHTML = `<!doctype html>
       $('miners').innerHTML = s.miners.map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, m.roundShares || 0, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '', '']);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       document.getElementById("balances").innerHTML = wallets.map(w => row([w, (s.balances || {})[w] || 0, (s.pendingBalances || {})[w] || 0, (((s.balances || {})[w] || 0) + ((s.pendingBalances || {})[w] || 0)).toFixed(8)])).join("") || row(["No balances yet", "0", "0", "0"]);
-      $('payments').innerHTML = (s.payments || []).map(p => row([p.wallet, p.amountAntd, p.status, p.txHash || '-'])).join('') || row(['No payouts yet', '', '', '']);
+      paymentsRows = (s.payments || []).slice().reverse();
+      renderPayments();
     }
+    $('paymentsPrev').onclick = () => { paymentsPage--; renderPayments(); };
+    $('paymentsNext').onclick = () => { paymentsPage++; renderPayments(); };
     $('refresh').onclick = load;
     $('runPayments').onclick = async () => {
       $('runPayments').disabled = true;
@@ -1578,6 +1596,7 @@ const userHTML = `<!doctype html>
     .label { color:var(--muted); font-size:12px; text-transform:uppercase; font-weight:750; }
     .value { margin-top:8px; font-size:24px; font-weight:780; overflow-wrap:anywhere; }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .pager { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; flex-wrap:wrap; }
     input { flex:1 1 360px; min-width:240px; border:1px solid var(--line); border-radius:6px; padding:10px 12px; font:inherit; }
     button, a.button { border:1px solid #0f4ea8; background:var(--blue); color:white; border-radius:6px; padding:10px 12px; font-weight:700; cursor:pointer; text-decoration:none; display:inline-block; }
     table { width:100%; border-collapse:collapse; }
@@ -1615,12 +1634,26 @@ const userHTML = `<!doctype html>
     <section class="panel">
       <h2>Payments</h2>
       <table><thead><tr><th>Amount</th><th>Status</th><th>Transaction</th><th>Created</th></tr></thead><tbody id="payments"></tbody></table>
+      <div class="pager"><button id="paymentsPrev">Previous</button><span id="paymentsPage" class="muted">Page 1 of 1</span><button id="paymentsNext">Next</button></div>
     </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
     const money = (v) => (Number(v || 0)).toFixed(8) + ' ANTD';
+    const paymentsPageSize = 25;
+    let paymentsPage = 0;
+    let paymentsRows = [];
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
+    function renderPayments() {
+      const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
+      paymentsPage = Math.min(Math.max(0, paymentsPage), totalPages - 1);
+      const start = paymentsPage * paymentsPageSize;
+      const visible = paymentsRows.slice(start, start + paymentsPageSize);
+      $('payments').innerHTML = visible.map(p => row([money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payments yet', '', '', '']);
+      $('paymentsPage').textContent = 'Page ' + (paymentsPage + 1) + ' of ' + totalPages + ' (' + paymentsRows.length + ' payments)';
+      $('paymentsPrev').disabled = paymentsPage <= 0;
+      $('paymentsNext').disabled = paymentsPage >= totalPages - 1;
+    }
     function setAddress(value) {
       const url = new URL(location.href);
       if (value) url.searchParams.set('address', value); else url.searchParams.delete('address');
@@ -1639,10 +1672,13 @@ const userHTML = `<!doctype html>
       $('paid').textContent = money(s.totalPaid);
       $('shares').textContent = String((s.acceptedShares || 0) + ' / ' + (s.rejectedShares || 0));
       $('workers').innerHTML = (s.workers || []).map(w => row([w.worker || '-', w.acceptedShares, w.rejectedShares, w.roundShares || 0, new Date(w.lastSeen).toLocaleString()])).join('') || row(['No workers found', '', '', '', '']);
-      $('payments').innerHTML = (s.payments || []).slice().reverse().map(p => row([money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payments yet', '', '', '']);
+      paymentsRows = (s.payments || []).slice().reverse();
+      renderPayments();
     }
-    $('lookup').onclick = load;
-    $('address').addEventListener('keydown', e => { if (e.key === 'Enter') load(); });
+    $('paymentsPrev').onclick = () => { paymentsPage--; renderPayments(); };
+    $('paymentsNext').onclick = () => { paymentsPage++; renderPayments(); };
+    $('lookup').onclick = () => { paymentsPage = 0; load(); };
+    $('address').addEventListener('keydown', e => { if (e.key === 'Enter') { paymentsPage = 0; load(); } });
     const initial = new URLSearchParams(location.search).get('address') || '';
     if (initial) { $('address').value = initial; load(); }
   </script>
@@ -1679,6 +1715,7 @@ const adminHTML = `<!doctype html>
     .bad { color:var(--red); font-weight:750; }
     .muted { color:var(--muted); }
     .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .pager { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; flex-wrap:wrap; }
     .split { display:grid; gap:14px; grid-template-columns:1fr 1fr; }
     @media (max-width: 920px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } .split { grid-template-columns:1fr; } main { padding:16px; } }
     @media (max-width: 560px) { .grid { grid-template-columns:1fr; } header { padding:18px; } .value { font-size:20px; } }
@@ -1733,15 +1770,29 @@ const adminHTML = `<!doctype html>
     <section class="section panel">
       <h2>Recent Payouts</h2>
       <table><thead><tr><th>Wallet</th><th>Amount</th><th>Status</th><th>Transaction</th><th>Created</th></tr></thead><tbody id="payments"></tbody></table>
+      <div class="pager"><button id="paymentsPrev">Previous</button><span id="paymentsPage" class="muted">Page 1 of 1</span><button id="paymentsNext">Next</button></div>
     </section>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
     const money = (v) => (Number(v || 0)).toFixed(8) + ' ANTD';
+    const paymentsPageSize = 25;
+    let paymentsPage = 0;
+    let paymentsRows = [];
     const yesno = (v) => v ? '<span class="ok">yes</span>' : '<span class="bad">no</span>';
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
     function kv(k, v) { return '<tr><th>' + k + '</th><td>' + String(v ?? '') + '</td></tr>'; }
     function errText(v) { return v ? '<span class="bad">' + String(v) + '</span>' : ''; }
+    function renderPayments() {
+      const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
+      paymentsPage = Math.min(Math.max(0, paymentsPage), totalPages - 1);
+      const start = paymentsPage * paymentsPageSize;
+      const visible = paymentsRows.slice(start, start + paymentsPageSize);
+      $('payments').innerHTML = visible.map(p => row([p.wallet, money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payouts yet', '', '', '', '']);
+      $('paymentsPage').textContent = 'Page ' + (paymentsPage + 1) + ' of ' + totalPages + ' (' + paymentsRows.length + ' payouts)';
+      $('paymentsPrev').disabled = paymentsPage <= 0;
+      $('paymentsNext').disabled = paymentsPage >= totalPages - 1;
+    }
     async function load() {
       const res = await fetch('/api/admin/status');
       const s = await res.json();
@@ -1764,8 +1815,11 @@ const adminHTML = `<!doctype html>
         return row([w, money(confirmed), money(pending), money(confirmed + pending)]);
       }).join('') || row(['No balances yet', money(0), money(0), money(0)]);
       $('miners').innerHTML = (s.miners || []).map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, m.roundShares || 0, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '', '']);
-      $('payments').innerHTML = (s.payments || []).slice().reverse().slice(0, 50).map(p => row([p.wallet, money(p.amountAntd), p.status, p.txHash || '-', new Date(p.createdAt).toLocaleString()])).join('') || row(['No payouts yet', '', '', '', '']);
+      paymentsRows = (s.payments || []).slice().reverse();
+      renderPayments();
     }
+    $('paymentsPrev').onclick = () => { paymentsPage--; renderPayments(); };
+    $('paymentsNext').onclick = () => { paymentsPage++; renderPayments(); };
     $('refresh').onclick = load;
     $('runPayments').onclick = async () => {
       $('runPayments').disabled = true;
