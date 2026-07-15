@@ -24,6 +24,37 @@ func TestNormalizeAddressCanonicalizesCase(t *testing.T) {
 	}
 }
 
+func TestNormalizeAddressCanonicalizesPrefix(t *testing.T) {
+	want := "0xf03a2a24c8926dba5a44301c751aec047b60b0a6"
+	cases := []string{
+		"f03a2a24c8926dba5a44301c751aec047b60b0a6",
+		"0xf03a2a24c8926dba5a44301c751aec047b60b0a6",
+		"0Xf03a2a24c8926dba5a44301c751aec047b60b0a6",
+		"0x0xf03a2a24c8926dba5a44301c751aec047b60b0a6",
+		"  0X0xF03a2a24C8926dBA5A44301C751aec047B60B0a6  ",
+	}
+
+	for _, input := range cases {
+		got := normalizeAddress(input)
+		if got != want {
+			t.Fatalf("normalizeAddress(%q) = %q, want %q", input, got, want)
+		}
+		if !isValidAddress(got) {
+			t.Fatalf("canonical address %q should be valid", got)
+		}
+	}
+}
+
+func TestParseAuthorizeRejectsBadAddress(t *testing.T) {
+	wallet, worker := parseAuthorize(json.RawMessage(`["0x0xnot-a-wallet.rig1"]`))
+	if wallet != "" {
+		t.Fatalf("parseAuthorize wallet = %q, want rejected empty wallet", wallet)
+	}
+	if worker != "rig1" {
+		t.Fatalf("parseAuthorize worker = %q, want rig1", worker)
+	}
+}
+
 func TestApplyPayoutStateMergesSameAddressWithDifferentCase(t *testing.T) {
 	lower := "0xf03a2a24c8926dba5a44301c751aec047b60b0a6"
 	mixed := "0xF03a2a24C8926dBA5A44301C751aec047B60B0a6"
