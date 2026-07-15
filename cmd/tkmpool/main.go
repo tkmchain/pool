@@ -319,21 +319,34 @@ func (p *Pool) applyPayoutStateLocked(state PayoutState) {
 	}
 	if state.Miners != nil {
 		p.miners = make(map[string]*Miner, len(state.Miners))
-		for key, miner := range state.Miners {
+		for _, miner := range state.Miners {
 			miner.Wallet = normalizeAddress(miner.Wallet)
 			if !isValidAddress(miner.Wallet) {
 				log.Printf("dropping invalid miner wallet=%s", miner.Wallet)
 				continue
 			}
-			if key == "" {
-				key = minerKey(miner.Wallet, miner.Worker)
-			}
-			m := miner
-			p.miners[key] = &m
+			p.mergeMinerLocked(miner)
 		}
 	}
 	if state.TotalShares > 0 {
 		p.shares.Store(state.TotalShares)
+	}
+}
+
+func (p *Pool) mergeMinerLocked(miner Miner) {
+	miner.Wallet = normalizeAddress(miner.Wallet)
+	key := minerKey(miner.Wallet, miner.Worker)
+	existing := p.miners[key]
+	if existing == nil {
+		m := miner
+		p.miners[key] = &m
+		return
+	}
+	existing.AcceptedShares += miner.AcceptedShares
+	existing.RejectedShares += miner.RejectedShares
+	existing.RoundShares += miner.RoundShares
+	if miner.LastSeen.After(existing.LastSeen) {
+		existing.LastSeen = miner.LastSeen
 	}
 }
 
@@ -802,7 +815,7 @@ func normalizeAddress(s string) string {
 		s = s[2:]
 	}
 	if len(s) == 40 && isHexString(s) {
-		return "0x" + s
+		return "0x" + strings.ToLower(s)
 	}
 	return strings.TrimSpace(s)
 }
