@@ -932,20 +932,17 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 
 	confirmedBalance, blockNumber, err := p.rpc.ConfirmedBalance(ctx, p.cfg.PoolWallet, confirmations)
 	if err != nil {
-		log.Printf("autopay skipped: confirmed pool balance check failed: %v", err)
 		p.recordPaymentStatuses(due, "waiting: confirmed pool balance check failed: "+err.Error())
 		return
 	}
 	pendingBalance, err := p.rpc.BalanceAt(ctx, p.cfg.PoolWallet, "pending")
 	if err != nil {
-		log.Printf("autopay skipped: pending pool balance check failed: %v", err)
 		p.recordPaymentStatuses(due, "waiting: pending pool balance check failed: "+err.Error())
 		return
 	}
 	availableBalance := minBigInt(confirmedBalance, pendingBalance)
 	spendable := new(big.Int).Sub(availableBalance, antdToWeiInt(p.cfg.PayoutReserveAntd))
 	if spendable.Sign() <= 0 {
-		log.Printf("autopay skipped: pool balance is below reserve block=%d confirmedWei=%s pendingWei=%s reserveTkm=%f", blockNumber, confirmedBalance.String(), pendingBalance.String(), p.cfg.PayoutReserveAntd)
 		p.recordPaymentStatuses(due, fmt.Sprintf("waiting: pool balance below reserve at block %d", blockNumber))
 		return
 	}
@@ -955,7 +952,6 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 		if amountWei.Cmp(spendable) > 0 {
 			spendableAntd := weiToAntd(spendable)
 			if spendableAntd < p.cfg.MinPayoutAntd {
-				log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
 				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
 				continue
 			}
@@ -965,10 +961,8 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 		feeWei, err := p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
 		if err != nil {
 			if isInsufficientFundsError(err) {
-				log.Printf("autopay waiting for pool balance during fee estimate wallet=%s amountTkm=%f block=%d", payment.Wallet, payment.Amount, blockNumber)
 				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
 			} else {
-				log.Printf("autopay skipped: payout fee estimate failed wallet=%s amountTkm=%f: %v", payment.Wallet, payment.Amount, err)
 				p.recordPaymentStatuses([]Payment{payment}, "waiting: payout fee estimate failed: "+err.Error())
 			}
 			continue
@@ -983,22 +977,18 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 				feeWei, err = p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
 				if err != nil {
 					if isInsufficientFundsError(err) {
-						log.Printf("autopay waiting for pool balance during fee estimate wallet=%s amountTkm=%f block=%d", payment.Wallet, payment.Amount, blockNumber)
 						p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
 					} else {
-						log.Printf("autopay skipped: payout fee estimate failed wallet=%s amountTkm=%f: %v", payment.Wallet, payment.Amount, err)
 						p.recordPaymentStatuses([]Payment{payment}, "waiting: payout fee estimate failed: "+err.Error())
 					}
 					continue
 				}
 				payoutCost = new(big.Int).Add(amountWei, feeWei)
 				if payoutCost.Cmp(spendable) > 0 {
-					log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s feeWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String(), feeWei.String())
 					p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
 					continue
 				}
 			} else {
-				log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s feeWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String(), feeWei.String())
 				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
 				continue
 			}
@@ -1008,7 +998,6 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 		if err != nil {
 			if isInsufficientFundsError(err) {
 				payment.Status = fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber)
-				log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d", payment.Wallet, payment.Amount, blockNumber)
 			} else {
 				payment.Status = "failed: " + err.Error()
 			}
@@ -1409,7 +1398,6 @@ func (r *RPCClient) callWithStateRetry(ctx context.Context, method string, param
 			return err
 		}
 		delay := time.Duration(100*(attempt+1)) * time.Millisecond
-		log.Printf("rpc transient state read failed; retrying method=%s attempt=%d delay=%s err=%v", method, attempt+1, delay, err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
