@@ -825,6 +825,11 @@ func isValidAddress(s string) bool {
 	return len(s) == 42 && strings.HasPrefix(strings.ToLower(s), "0x") && isHexString(s[2:])
 }
 
+func isValidHash(s string) bool {
+	s = normalizeHex(s)
+	return len(s) == 66 && strings.HasPrefix(strings.ToLower(s), "0x") && isHexString(s[2:])
+}
+
 func isHexString(s string) bool {
 	for _, c := range s {
 		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
@@ -931,10 +936,17 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 		p.recordPaymentStatuses(due, "waiting: confirmed pool balance check failed: "+err.Error())
 		return
 	}
-	spendable := new(big.Int).Sub(confirmedBalance, antdToWeiInt(p.cfg.PayoutReserveAntd))
+	pendingBalance, err := p.rpc.BalanceAt(ctx, p.cfg.PoolWallet, "pending")
+	if err != nil {
+		log.Printf("autopay skipped: pending pool balance check failed: %v", err)
+		p.recordPaymentStatuses(due, "waiting: pending pool balance check failed: "+err.Error())
+		return
+	}
+	availableBalance := minBigInt(confirmedBalance, pendingBalance)
+	spendable := new(big.Int).Sub(availableBalance, antdToWeiInt(p.cfg.PayoutReserveAntd))
 	if spendable.Sign() <= 0 {
-		log.Printf("autopay skipped: confirmed pool balance is below reserve block=%d balanceWei=%s reserveTkm=%f", blockNumber, confirmedBalance.String(), p.cfg.PayoutReserveAntd)
-		p.recordPaymentStatuses(due, fmt.Sprintf("waiting: confirmed pool balance below reserve at block %d", blockNumber))
+		log.Printf("autopay skipped: pool balance is below reserve block=%d confirmedWei=%s pendingWei=%s reserveTkm=%f", blockNumber, confirmedBalance.String(), pendingBalance.String(), p.cfg.PayoutReserveAntd)
+		p.recordPaymentStatuses(due, fmt.Sprintf("waiting: pool balance below reserve at block %d", blockNumber))
 		return
 	}
 
@@ -942,19 +954,64 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 		amountWei := antdToWeiInt(payment.Amount)
 		if amountWei.Cmp(spendable) > 0 {
 			spendableAntd := weiToAntd(spendable)
+			if spendableAntd < p.cfg.MinPayoutAntd {
+				log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
+				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
+				continue
+			}
+			payment.Amount = round(minFloat(spendableAntd, p.cfg.MaxPayoutPerTxAntd))
+			amountWei = antdToWeiInt(payment.Amount)
+		}
+		feeWei, err := p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
+		if err != nil {
+			if isInsufficientFundsError(err) {
+				log.Printf("autopay waiting for pool balance during fee estimate wallet=%s amountTkm=%f block=%d", payment.Wallet, payment.Amount, blockNumber)
+				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
+			} else {
+				log.Printf("autopay skipped: payout fee estimate failed wallet=%s amountTkm=%f: %v", payment.Wallet, payment.Amount, err)
+				p.recordPaymentStatuses([]Payment{payment}, "waiting: payout fee estimate failed: "+err.Error())
+			}
+			continue
+		}
+		payoutCost := new(big.Int).Add(amountWei, feeWei)
+		if payoutCost.Cmp(spendable) > 0 {
+			valueBudget := new(big.Int).Sub(spendable, feeWei)
+			spendableAntd := weiToAntd(valueBudget)
 			if spendableAntd >= p.cfg.MinPayoutAntd {
 				payment.Amount = round(minFloat(spendableAntd, p.cfg.MaxPayoutPerTxAntd))
 				amountWei = antdToWeiInt(payment.Amount)
+				feeWei, err = p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
+				if err != nil {
+					if isInsufficientFundsError(err) {
+						log.Printf("autopay waiting for pool balance during fee estimate wallet=%s amountTkm=%f block=%d", payment.Wallet, payment.Amount, blockNumber)
+						p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
+					} else {
+						log.Printf("autopay skipped: payout fee estimate failed wallet=%s amountTkm=%f: %v", payment.Wallet, payment.Amount, err)
+						p.recordPaymentStatuses([]Payment{payment}, "waiting: payout fee estimate failed: "+err.Error())
+					}
+					continue
+				}
+				payoutCost = new(big.Int).Add(amountWei, feeWei)
+				if payoutCost.Cmp(spendable) > 0 {
+					log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s feeWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String(), feeWei.String())
+					p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
+					continue
+				}
 			} else {
-				log.Printf("autopay waiting for confirmed pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String())
-				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: insufficient confirmed pool balance at block %d", blockNumber))
+				log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d spendableWei=%s feeWei=%s", payment.Wallet, payment.Amount, blockNumber, spendable.String(), feeWei.String())
+				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
 				continue
 			}
 		}
 		tx, err := p.rpc.SendPayment(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount, p.cfg.PoolWalletPassword)
 		p.mu.Lock()
 		if err != nil {
-			payment.Status = "failed: " + err.Error()
+			if isInsufficientFundsError(err) {
+				payment.Status = fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber)
+				log.Printf("autopay waiting for pool balance wallet=%s amountTkm=%f block=%d", payment.Wallet, payment.Amount, blockNumber)
+			} else {
+				payment.Status = "failed: " + err.Error()
+			}
 		} else {
 			payment.Status = "sent"
 			payment.TxHash = tx
@@ -962,7 +1019,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 			if p.balances[payment.Wallet] <= 0 {
 				delete(p.balances, payment.Wallet)
 			}
-			spendable.Sub(spendable, amountWei)
+			spendable.Sub(spendable, payoutCost)
 		}
 		p.payments = append(p.payments, payment)
 		p.savePayoutStateLocked()
@@ -1192,13 +1249,58 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 		poolWalletBalance["confirmedBlock"] = confirmedBlock
 	} else {
 		confirmedAntd := weiToAntd(confirmedWei)
-		spendableAntd := round(confirmedAntd - p.cfg.PayoutReserveAntd)
-		if spendableAntd < 0 {
-			spendableAntd = 0
+		pendingWei, pendingErr := p.rpc.BalanceAt(r.Context(), p.cfg.PoolWallet, "pending")
+		if pendingErr != nil {
+			poolWalletBalance["pendingError"] = pendingErr.Error()
+			pendingWei = confirmedWei
+		} else {
+			poolWalletBalance["pendingAntd"] = weiToAntd(pendingWei)
 		}
+		availableWei := minBigInt(confirmedWei, pendingWei)
+		spendableWei := new(big.Int).Sub(availableWei, antdToWeiInt(p.cfg.PayoutReserveAntd))
+		if spendableWei.Sign() < 0 {
+			spendableWei = new(big.Int)
+		}
+		spendableAntd := weiToAntd(spendableWei)
 		poolWalletBalance["confirmedAntd"] = confirmedAntd
 		poolWalletBalance["confirmedBlock"] = confirmedBlock
+		poolWalletBalance["availableAntd"] = weiToAntd(availableWei)
 		poolWalletBalance["spendableAntd"] = spendableAntd
+		poolWalletBalance["lowBalance"] = false
+		poolWalletBalance["payoutStatus"] = "ready"
+		poolWalletBalance["totalOwedAntd"] = sumFloatMap(balances)
+
+		for wallet, balance := range balances {
+			if balance < p.cfg.MinPayoutAntd {
+				continue
+			}
+			nextAmount := round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd))
+			poolWalletBalance["nextPayoutWallet"] = wallet
+			poolWalletBalance["nextPayoutAntd"] = nextAmount
+			feeWei, err := p.rpc.PaymentFee(r.Context(), p.cfg.PoolWallet, wallet, nextAmount)
+			if err != nil {
+				if isInsufficientFundsError(err) {
+					poolWalletBalance["lowBalance"] = true
+					poolWalletBalance["payoutStatus"] = "low pool wallet balance"
+				} else {
+					poolWalletBalance["feeEstimateError"] = err.Error()
+				}
+				break
+			}
+			spendableAfterFee := new(big.Int).Sub(spendableWei, feeWei)
+			if spendableAfterFee.Sign() < 0 {
+				spendableAfterFee = new(big.Int)
+			}
+			poolWalletBalance["estimatedTxFeeAntd"] = weiToAntd(feeWei)
+			poolWalletBalance["spendableAfterFeeAntd"] = weiToAntd(spendableAfterFee)
+			if new(big.Int).Add(antdToWeiInt(nextAmount), feeWei).Cmp(spendableWei) > 0 {
+				poolWalletBalance["lowBalance"] = true
+				poolWalletBalance["payoutStatus"] = "low pool wallet balance"
+			} else {
+				poolWalletBalance["payoutStatus"] = "next payout can be sent"
+			}
+			break
+		}
 	}
 
 	redisInfo := map[string]any{
@@ -1299,6 +1401,32 @@ func (r *RPCClient) call(ctx context.Context, method string, params any, result 
 	return nil
 }
 
+func (r *RPCClient) callWithStateRetry(ctx context.Context, method string, params []any, result any) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		err = r.call(ctx, method, params, result)
+		if err == nil || !isTransientStateReadError(err) {
+			return err
+		}
+		delay := time.Duration(100*(attempt+1)) * time.Millisecond
+		log.Printf("rpc transient state read failed; retrying method=%s attempt=%d delay=%s err=%v", method, attempt+1, delay, err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return err
+}
+
+func isTransientStateReadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "layer stale") || strings.Contains(msg, "missing trie node") || strings.Contains(msg, "getstateobject")
+}
+
 func (r *RPCClient) GetWork(ctx context.Context) (Work, error) {
 	var tuple []string
 	switch r.method {
@@ -1373,6 +1501,22 @@ func (r *RPCClient) SetEtherbase(ctx context.Context, address string) (bool, err
 	return ok, nil
 }
 
+func (r *RPCClient) BalanceAt(ctx context.Context, address, block string) (*big.Int, error) {
+	address = normalizeAddress(address)
+	if !isValidAddress(address) {
+		return nil, fmt.Errorf("invalid balance address %q", address)
+	}
+	var balanceHex string
+	if err := r.callWithStateRetry(ctx, "eth_getBalance", []any{address, block}, &balanceHex); err != nil {
+		return nil, err
+	}
+	balance, ok := parseBigFlexible(balanceHex)
+	if !ok {
+		return nil, fmt.Errorf("invalid balance result %q", balanceHex)
+	}
+	return balance, nil
+}
+
 func (r *RPCClient) ConfirmedBalance(ctx context.Context, address string, confirmations int) (*big.Int, uint64, error) {
 	address = normalizeAddress(address)
 	if !isValidAddress(address) {
@@ -1389,13 +1533,9 @@ func (r *RPCClient) ConfirmedBalance(ctx context.Context, address string, confir
 		}
 		confirmed = head - uint64(confirmations)
 	}
-	var balanceHex string
-	if err := r.call(ctx, "eth_getBalance", []any{address, fmt.Sprintf("0x%x", confirmed)}, &balanceHex); err != nil {
+	balance, err := r.BalanceAt(ctx, address, fmt.Sprintf("0x%x", confirmed))
+	if err != nil {
 		return nil, confirmed, err
-	}
-	balance, ok := new(big.Int).SetString(strings.TrimPrefix(balanceHex, "0x"), 16)
-	if !ok {
-		return nil, confirmed, fmt.Errorf("invalid balance result %q", balanceHex)
 	}
 	return balance, confirmed, nil
 }
@@ -1417,6 +1557,50 @@ func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd
 	}
 	err := r.call(ctx, "eth_sendTransaction", []any{txArgs}, &tx)
 	return tx, err
+}
+
+func (r *RPCClient) PaymentFee(ctx context.Context, from, to string, amountAntd float64) (*big.Int, error) {
+	from = normalizeAddress(from)
+	to = normalizeAddress(to)
+	if !isValidAddress(from) {
+		return nil, fmt.Errorf("invalid payout from address %q", from)
+	}
+	if !isValidAddress(to) {
+		return nil, fmt.Errorf("invalid payout to address %q", to)
+	}
+	txArgs := map[string]any{"from": from, "to": to, "value": antdToWeiHex(amountAntd)}
+	var gasHex string
+	if err := r.callWithStateRetry(ctx, "eth_estimateGas", []any{txArgs}, &gasHex); err != nil {
+		return nil, err
+	}
+	gas, ok := parseBigFlexible(gasHex)
+	if !ok {
+		return nil, fmt.Errorf("invalid gas estimate result %q", gasHex)
+	}
+	var gasPriceHex string
+	if err := r.call(ctx, "eth_gasPrice", []any{}, &gasPriceHex); err != nil {
+		return nil, err
+	}
+	gasPrice, ok := parseBigFlexible(gasPriceHex)
+	if !ok {
+		return nil, fmt.Errorf("invalid gas price result %q", gasPriceHex)
+	}
+	return new(big.Int).Mul(gas, gasPrice), nil
+}
+
+func isInsufficientFundsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "insufficient funds") || strings.Contains(msg, "overshot")
+}
+
+func minBigInt(a, b *big.Int) *big.Int {
+	if a.Cmp(b) <= 0 {
+		return new(big.Int).Set(a)
+	}
+	return new(big.Int).Set(b)
 }
 
 func minFloat(a, b float64) float64 {
@@ -1470,6 +1654,14 @@ func parseUintFlexible(s string) uint64 {
 	}
 	v, _ := strconv.ParseUint(s, 10, 64)
 	return v
+}
+
+func parseBigFlexible(s string) (*big.Int, bool) {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "0x") {
+		return new(big.Int).SetString(strings.TrimPrefix(s, "0x"), 16)
+	}
+	return new(big.Int).SetString(s, 10)
 }
 
 func round(v float64) float64 {
@@ -1745,7 +1937,7 @@ const adminHTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{POOL_NAME}} Admin</title>
   <style>
-    :root { color-scheme: light; --bg:#f5f7fb; --ink:#141821; --muted:#5b6472; --line:#d8dee8; --panel:#fff; --green:#12715b; --red:#b42318; --blue:#174ea6; }
+    :root { color-scheme: light; --bg:#f5f7fb; --ink:#141821; --muted:#5b6472; --line:#d8dee8; --panel:#fff; --green:#12715b; --red:#b42318; --orange:#9a5b00; --blue:#174ea6; }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
     header { background:#151922; color:#fff; padding:20px 28px; display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
@@ -1766,6 +1958,7 @@ const adminHTML = `<!doctype html>
     button:disabled { opacity:.55; cursor:wait; }
     .ok { color:var(--green); font-weight:750; }
     .bad { color:var(--red); font-weight:750; }
+    .warn { color:var(--orange); font-weight:750; }
     .muted { color:var(--muted); }
     .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
     .pager { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; flex-wrap:wrap; }
@@ -1855,13 +2048,14 @@ const adminHTML = `<!doctype html>
       const b = s.poolWalletBalance || {};
       $('latestBalance').innerHTML = b.latestError ? errText(b.latestError) : money(b.latestAntd);
       $('latestBlock').textContent = b.latestBlock !== undefined ? 'block ' + b.latestBlock : '';
-      $('spendableBalance').innerHTML = b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd);
-      $('confirmedBlock').textContent = b.confirmedBlock !== undefined ? 'confirmed block ' + b.confirmedBlock : '';
+      $('spendableBalance').innerHTML = b.confirmedError ? errText(b.confirmedError) : (b.lowBalance ? '<span class="warn">' + money(b.spendableAntd) + '</span>' : money(b.spendableAntd));
+      $('confirmedBlock').textContent = b.confirmedError ? '' : ((b.payoutStatus || '') + (b.confirmedBlock !== undefined ? ' at confirmed block ' + b.confirmedBlock : ''));
       $('owedBalance').textContent = money(s.totalConfirmedMinerBalanceAntd);
       $('pendingBalance').textContent = 'pending round ' + money(s.totalPendingRoundAntd);
       $('redisStatus').innerHTML = s.redis && s.redis.ok ? '<span class="ok">online</span>' : '<span class="bad">offline</span>';
       $('redisBytes').textContent = s.redis && s.redis.ok ? String(s.redis.stateBytes || 0) + ' bytes saved' : ((s.redis && s.redis.error) || '');
-      $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
+      const payoutStatus = b.confirmedError ? errText(b.confirmedError) : (b.lowBalance ? '<span class="warn">' + (b.payoutStatus || 'low pool wallet balance') + '</span>' : '<span class="ok">' + (b.payoutStatus || 'ready') + '</span>');
+      $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Payout status', payoutStatus) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Pending balance', b.pendingError ? errText(b.pendingError) : (b.pendingAntd !== undefined ? money(b.pendingAntd) : '-')) + kv('Usable balance', b.availableAntd !== undefined ? money(b.availableAntd) : '-') + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Total miner balance owed', b.totalOwedAntd !== undefined ? money(b.totalOwedAntd) : money(s.totalConfirmedMinerBalanceAntd)) + kv('Estimated next tx fee', b.estimatedTxFeeAntd !== undefined ? money(b.estimatedTxFeeAntd) : (b.feeEstimateError ? errText(b.feeEstimateError) : '-')) + kv('Spendable after next fee', b.spendableAfterFeeAntd !== undefined ? money(b.spendableAfterFeeAntd) : '-') + kv('Next payout', b.nextPayoutAntd !== undefined ? money(b.nextPayoutAntd) + ' to ' + b.nextPayoutWallet : '-') + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
       $('runtimeRows').innerHTML = kv('Public URL', s.publicURL) + kv('HTTP bind', s.http) + kv('Stratum public', s.stratum) + kv('Stratum bind', s.stratumBind) + kv('Explorer', s.explorerURL || '-') + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Connected miners', s.authorizedSessions ?? s.connectedSessions ?? 0) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
       $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Recent payment records', s.paymentCount);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
