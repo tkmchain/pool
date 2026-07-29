@@ -1,0 +1,22 @@
+{
+  "autosave": true,
+  "cpu": true,
+  "opencl": false,
+  "cuda": false,
+  "pools": [
+    {
+      "algo": "rx/tkm",
+      "url": "127.0.0.1:33330",
+      "user": "0xYourPayoutWallet.worker1",
+      "pass": "x",
+      "keepalive": true,
+      "tls": false
+    }
+  ],
+  "randomx": {
+    "mode": "auto",
+    "1gb-pages": false,
+    "rdmsr": false,
+    "wrmsr": false
+  }
+}

@@ -33,14 +33,40 @@ If your daemon logs `the method randomx_getWork does not exist/is not available`
 
 ## Miner
 
-Point RandomX miners at the pool stratum endpoint:
+The pool supports the patched TKM XMRig miner in `~/xmrig`. The miner uses algorithm `rx/tkm`, which hashes the exact TKMChain RandomX input used by `gtkm`:
 
-```sh
-stratum+tcp://127.0.0.1:3333
+```text
+RandomX(seedHash, sealHash || 8-byte header nonce)
 ```
 
-Use the payout wallet as username. Worker names are supported with
-`0xWallet.worker1`. Pool share acceptance uses `shareTarget`; block candidates are still checked against the daemon work target before submission.
+Point XMRig at the pool Stratum endpoint:
+
+```sh
+~/xmrig/build/xmrig -a rx/tkm -o 127.0.0.1:33330 -u 0xYourPayoutWallet.worker1 -p x
+```
+
+Or start it with the example config:
+
+```sh
+~/xmrig/build/xmrig -c ~/pool/xmrig-tkm.example.json
+```
+
+Use the payout wallet as username. Worker names are supported with `0xWallet.worker1`. Pool share acceptance uses `shareTarget`; block candidates are still checked against the daemon work target before submission to `gtkm`.
+
+The pool also keeps the older `mining.subscribe`, `mining.authorize`, and array-style `mining.submit` flow for existing miners. XMRig uses the newer `login`, `job`, `submit`, and `keepalived` flow.
+
+### Build the patched XMRig
+
+Install build dependencies, then configure and build XMRig:
+
+```sh
+cd ~/xmrig
+sudo apt-get install -y build-essential cmake libuv1-dev libssl-dev
+cmake -S . -B build -DWITH_OPENCL=OFF -DWITH_CUDA=OFF -DWITH_HWLOC=OFF
+cmake --build build -j$(nproc)
+```
+
+If you want hwloc CPU topology support, install `libhwloc-dev` and remove `-DWITH_HWLOC=OFF`.
 
 ## Payments
 

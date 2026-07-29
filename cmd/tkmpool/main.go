@@ -113,6 +113,8 @@ type stratumSession struct {
 	mu     sync.Mutex
 	wallet string
 	worker string
+	xmrig  bool
+	rpcID  string
 }
 
 func (s *stratumSession) write(v any) {
@@ -558,6 +560,39 @@ func (p *Pool) handleStratum(conn net.Conn) {
 		}
 
 		switch req.Method {
+		case "login":
+			wallet, worker = parseXMRigLogin(req.Params)
+			if wallet != "" {
+				session.mu.Lock()
+				session.wallet = wallet
+				session.worker = worker
+				session.xmrig = true
+				session.rpcID = sessionID
+				session.mu.Unlock()
+				log.Printf("xmrig miner connected miner=%s", minerLabel(wallet, worker))
+				p.touchMiner(wallet, worker)
+			}
+			result := map[string]any{"id": sessionID, "extensions": []string{"algo"}}
+			if wallet != "" {
+				if job := p.xmrigJobObject(session); job != nil {
+					result["job"] = job
+				}
+			}
+			session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": result, "error": nil})
+		case "submit":
+			if wallet == "" {
+				session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": false, "error": map[string]any{"code": -1, "message": "unauthorized"}})
+				continue
+			}
+			ok := p.submitShare(context.Background(), wallet, worker, req.Params, session)
+			if ok {
+				session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": map[string]any{"status": "OK"}, "error": nil})
+			} else {
+				session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": nil, "error": map[string]any{"code": -1, "message": "rejected"}})
+				p.logEvery("xmrigreject:"+minerKey(wallet, worker), 10*time.Second, "xmrig share rejected miner=%s", minerLabel(wallet, worker))
+			}
+		case "keepalived":
+			session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": map[string]any{"status": "KEEPALIVED"}, "error": nil})
 		case "mining.subscribe":
 			session.write(map[string]any{
 				"id":     req.ID,
@@ -602,6 +637,20 @@ func (p *Pool) notify(session *stratumSession, work Work) {
 	if work.SealHash == "" {
 		return
 	}
+	session.mu.Lock()
+	xmrigMode := session.xmrig
+	session.mu.Unlock()
+	if xmrigMode {
+		if job := p.xmrigJobObjectForWork(work); job != nil {
+			session.write(map[string]any{
+				"id":      nil,
+				"jsonrpc": "2.0",
+				"method":  "job",
+				"params":  job,
+			})
+		}
+		return
+	}
 	session.write(map[string]any{
 		"id":     nil,
 		"method": "mining.notify",
@@ -617,6 +666,27 @@ func (p *Pool) notify(session *stratumSession, work Work) {
 	})
 }
 
+func (p *Pool) xmrigJobObject(session *stratumSession) map[string]any {
+	p.mu.RLock()
+	work := p.work
+	p.mu.RUnlock()
+	return p.xmrigJobObjectForWork(work)
+}
+
+func (p *Pool) xmrigJobObjectForWork(work Work) map[string]any {
+	if work.SealHash == "" {
+		return nil
+	}
+	return map[string]any{
+		"job_id":    jobID(work),
+		"algo":      "rx/tkm",
+		"blob":      tkmXMRigBlob(work),
+		"seed_hash": trimHex(work.SeedHash),
+		"target":    xmrigShareTarget(p.cfg.ShareTarget),
+		"height":    work.Height,
+	}
+}
+
 func jobID(work Work) string {
 	return work.SealHash
 }
@@ -627,8 +697,19 @@ func parseAuthorize(raw json.RawMessage) (string, string) {
 	if len(params) == 0 {
 		return "", ""
 	}
-	user := params[0]
-	wallet, worker, _ := strings.Cut(user, ".")
+	return parseMinerLogin(params[0])
+}
+
+func parseXMRigLogin(raw json.RawMessage) (string, string) {
+	var params struct {
+		Login string `json:"login"`
+	}
+	_ = json.Unmarshal(raw, &params)
+	return parseMinerLogin(params.Login)
+}
+
+func parseMinerLogin(user string) (string, string) {
+	wallet, worker, _ := strings.Cut(strings.TrimSpace(user), ".")
 	wallet = normalizeAddress(wallet)
 	if !isValidAddress(wallet) {
 		log.Printf("invalid miner payout wallet rejected wallet=%s", strings.TrimSpace(wallet))
@@ -726,18 +807,13 @@ func (p *Pool) logEvery(key string, interval time.Duration, format string, args 
 }
 
 func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage, session *stratumSession) bool {
-	var params []string
-	_ = json.Unmarshal(raw, &params)
+	job, nonce, digest := parseShareSubmission(raw)
 	p.mu.RLock()
 	work := p.work
 	currentJob := jobID(work)
-	staleJob := len(params) < 2 || params[1] == "" || params[1] != currentJob
+	staleJob := job == "" || job != currentJob
 	p.mu.RUnlock()
 	if staleJob {
-		job := ""
-		if len(params) >= 2 {
-			job = params[1]
-		}
 		p.logEvery("stale:"+minerKey(wallet, worker), time.Minute, "stale shares miner=%s job=%s current=%s action=renotify", minerLabel(wallet, worker), shortID(job), shortID(currentJob))
 		if session != nil {
 			p.notify(session, work)
@@ -748,9 +824,9 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 
 	shareAccepted := false
 	blockAccepted := false
-	if work.SealHash != "" && len(params) >= 4 {
-		nonce := normalizeHex(params[2])
-		digest := normalizeHex(params[3])
+	if work.SealHash != "" {
+		nonce = normalizeTKMNonce(nonce)
+		digest = normalizeHex(digest)
 		if nonce != "" && digest != "" {
 			if digestMeetsTarget(digest, p.cfg.ShareTarget) {
 				shareAccepted = true
@@ -796,6 +872,65 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 		}
 	}
 	return shareAccepted
+}
+
+func parseShareSubmission(raw json.RawMessage) (job, nonce, digest string) {
+	var params []string
+	if err := json.Unmarshal(raw, &params); err == nil && len(params) >= 4 {
+		return strings.TrimSpace(params[1]), params[2], params[3]
+	}
+	var obj struct {
+		ID     string `json:"id"`
+		JobID  string `json:"job_id"`
+		Nonce  string `json:"nonce"`
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil {
+		return strings.TrimSpace(obj.JobID), obj.Nonce, obj.Result
+	}
+	return "", "", ""
+}
+
+func normalizeTKMNonce(nonce string) string {
+	nonce = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(nonce), "0x"), "0X")
+	if !isHexString(nonce) {
+		return ""
+	}
+	switch len(nonce) {
+	case 8:
+		return "0x00000000" + strings.ToLower(nonce)
+	case 16:
+		return "0x" + strings.ToLower(nonce)
+	default:
+		return ""
+	}
+}
+
+func tkmXMRigBlob(work Work) string {
+	seal := trimHex(work.SealHash)
+	if len(seal) != 64 || !isHexString(seal) {
+		return ""
+	}
+	return seal + "0000000000000000"
+}
+
+func trimHex(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		s = s[2:]
+	}
+	return strings.ToLower(s)
+}
+
+func xmrigShareTarget(target string) string {
+	hexTarget := trimHex(target)
+	if len(hexTarget) == 64 && isHexString(hexTarget) {
+		return hexTarget
+	}
+	if len(hexTarget) == 16 && isHexString(hexTarget) {
+		return strings.Repeat("0", 48) + hexTarget
+	}
+	return strings.Repeat("f", 64)
 }
 
 func normalizeHex(s string) string {
