@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -53,6 +54,8 @@ type Config struct {
 	RPCTimeoutSeconds      int     `json:"rpcTimeoutSeconds"`
 	WorkPollIntervalMs     int     `json:"workPollIntervalMs"`
 	ShareTarget            string  `json:"shareTarget"`
+	PrivacyCommitmentTime  uint64  `json:"privacyCommitmentTime"`
+	QuantumResistantTime   uint64  `json:"quantumResistantTime"`
 }
 
 type PayoutState struct {
@@ -85,6 +88,35 @@ type Payment struct {
 	TxHash    string    `json:"txHash,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
 }
+
+type RPCHeader struct {
+	Number    uint64
+	Timestamp uint64
+}
+
+type NetworkStatus struct {
+	LatestBlock              uint64 `json:"latestBlock"`
+	LatestTimestamp          uint64 `json:"latestTimestamp"`
+	HeadError                string `json:"headError,omitempty"`
+	PrivacyCommitmentTime    uint64 `json:"privacyCommitmentTime"`
+	PrivacyCommitmentActive  bool   `json:"privacyCommitmentActive"`
+	PrivacyCommitmentSource  string `json:"privacyCommitmentSource"`
+	PrivacyCommitmentError   string `json:"privacyCommitmentError,omitempty"`
+	QuantumResistantTime     uint64 `json:"quantumResistantTime"`
+	QuantumResistantActive   bool   `json:"quantumResistantActive"`
+	PoolWalletAlgorithm      string `json:"poolWalletAlgorithm,omitempty"`
+	PoolWalletAlgorithmError string `json:"poolWalletAlgorithmError,omitempty"`
+	PayoutTxType             string `json:"payoutTxType"`
+	PayoutReady              bool   `json:"payoutReady"`
+	PayoutBlockedReason      string `json:"payoutBlockedReason,omitempty"`
+}
+
+const (
+	pqTxTypeHex                         = "0x6"
+	pqAlgorithmMLDSA87                  = "ML-DSA-87"
+	tkmPrivacyQuantumActivationUnix     = uint64(1786341600) // 2026-08-10 06:00:00 UTC
+	privacyTransparentPayoutBlockReason = "privacy commitments are active; transparent pool payouts are disabled until a shielded payout prover is configured"
+)
 
 type Pool struct {
 	cfg      Config
@@ -182,6 +214,8 @@ func loadConfig(path string) (Config, error) {
 		RPCTimeoutSeconds:      60,
 		WorkPollIntervalMs:     500,
 		ShareTarget:            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		PrivacyCommitmentTime:  tkmPrivacyQuantumActivationUnix,
+		QuantumResistantTime:   tkmPrivacyQuantumActivationUnix,
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -233,6 +267,12 @@ func loadConfig(path string) (Config, error) {
 		cfg.ShareTarget = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	}
 	cfg.ShareTarget = normalizeHex(cfg.ShareTarget)
+	if cfg.PrivacyCommitmentTime == 0 {
+		cfg.PrivacyCommitmentTime = tkmPrivacyQuantumActivationUnix
+	}
+	if cfg.QuantumResistantTime == 0 {
+		cfg.QuantumResistantTime = tkmPrivacyQuantumActivationUnix
+	}
 	if cfg.RedisStateKey == "" {
 		cfg.RedisStateKey = "tkmpool:payout-state"
 	}
@@ -578,21 +618,21 @@ func (p *Pool) handleStratum(conn net.Conn) {
 					result["job"] = job
 				}
 			}
-			session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": result, "error": nil})
+			session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": result, "error": nil})
 		case "submit":
 			if wallet == "" {
-				session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": false, "error": map[string]any{"code": -1, "message": "unauthorized"}})
+				session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": false, "error": map[string]any{"code": -1, "message": "unauthorized"}})
 				continue
 			}
 			ok := p.submitShare(context.Background(), wallet, worker, req.Params, session)
 			if ok {
-				session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": map[string]any{"status": "OK"}, "error": nil})
+				session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": map[string]any{"status": "OK"}, "error": nil})
 			} else {
-				session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": nil, "error": map[string]any{"code": -1, "message": "rejected"}})
+				session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": nil, "error": map[string]any{"code": -1, "message": "rejected"}})
 				p.logEvery("xmrigreject:"+minerKey(wallet, worker), 10*time.Second, "xmrig share rejected miner=%s", minerLabel(wallet, worker))
 			}
 		case "keepalived":
-			session.write(map[string]any{"id": req.ID, "jsonrpc": "2.0", "result": map[string]any{"status": "KEEPALIVED"}, "error": nil})
+			session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": map[string]any{"status": "KEEPALIVED"}, "error": nil})
 		case "mining.subscribe":
 			session.write(map[string]any{
 				"id":     req.ID,
@@ -708,6 +748,20 @@ func parseXMRigLogin(raw json.RawMessage) (string, string) {
 	return parseMinerLogin(params.Login)
 }
 
+func jsonRPCResponseID(id any) any {
+	switch v := id.(type) {
+	case float64:
+		if math.Trunc(v) == v {
+			return int64(v)
+		}
+	case string:
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return id
+}
+
 func parseMinerLogin(user string) (string, string) {
 	wallet, worker, _ := strings.Cut(strings.TrimSpace(user), ".")
 	wallet = normalizeAddress(wallet)
@@ -815,7 +869,7 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 	p.mu.RUnlock()
 	if staleJob {
 		p.logEvery("stale:"+minerKey(wallet, worker), time.Minute, "stale shares miner=%s job=%s current=%s action=renotify", minerLabel(wallet, worker), shortID(job), shortID(currentJob))
-		if session != nil {
+		if session != nil && !session.xmrig {
 			p.notify(session, work)
 		}
 		p.recordRejectedShare(wallet, worker)
@@ -1065,6 +1119,12 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 		return
 	}
 
+	network := p.networkStatus(ctx)
+	if !network.PayoutReady {
+		p.recordPaymentStatuses(due, "waiting: "+network.PayoutBlockedReason)
+		return
+	}
+
 	confirmedBalance, blockNumber, err := p.rpc.ConfirmedBalance(ctx, p.cfg.PoolWallet, confirmations)
 	if err != nil {
 		p.recordPaymentStatuses(due, "waiting: confirmed pool balance check failed: "+err.Error())
@@ -1093,7 +1153,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 			payment.Amount = round(minFloat(spendableAntd, p.cfg.MaxPayoutPerTxAntd))
 			amountWei = antdToWeiInt(payment.Amount)
 		}
-		feeWei, err := p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
+		feeWei, err := p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount, network.PayoutTxType)
 		if err != nil {
 			if isInsufficientFundsError(err) {
 				p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
@@ -1109,7 +1169,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 			if spendableAntd >= p.cfg.MinPayoutAntd {
 				payment.Amount = round(minFloat(spendableAntd, p.cfg.MaxPayoutPerTxAntd))
 				amountWei = antdToWeiInt(payment.Amount)
-				feeWei, err = p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount)
+				feeWei, err = p.rpc.PaymentFee(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount, network.PayoutTxType)
 				if err != nil {
 					if isInsufficientFundsError(err) {
 						p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: low pool wallet balance at block %d", blockNumber))
@@ -1128,7 +1188,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 				continue
 			}
 		}
-		tx, err := p.rpc.SendPayment(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount, p.cfg.PoolWalletPassword)
+		tx, err := p.rpc.SendPayment(ctx, p.cfg.PoolWallet, payment.Wallet, payment.Amount, p.cfg.PoolWalletPassword, network.PayoutTxType)
 		p.mu.Lock()
 		if err != nil {
 			if isInsufficientFundsError(err) {
@@ -1149,6 +1209,77 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 		p.savePayoutStateLocked()
 		p.mu.Unlock()
 	}
+}
+
+func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
+	status := NetworkStatus{
+		PrivacyCommitmentTime:   p.cfg.PrivacyCommitmentTime,
+		PrivacyCommitmentSource: "configured",
+		QuantumResistantTime:    p.cfg.QuantumResistantTime,
+		PayoutReady:             true,
+	}
+
+	if header, err := p.rpc.LatestHeader(ctx); err != nil {
+		status.HeadError = err.Error()
+	} else {
+		status.LatestBlock = header.Number
+		status.LatestTimestamp = header.Timestamp
+		if status.PrivacyCommitmentTime > 0 && header.Timestamp >= status.PrivacyCommitmentTime {
+			status.PrivacyCommitmentActive = true
+			status.PrivacyCommitmentSource = "timestamp"
+		}
+		if status.QuantumResistantTime > 0 && header.Timestamp >= status.QuantumResistantTime {
+			status.QuantumResistantActive = true
+		}
+	}
+	if activationTime, ok, err := p.rpc.PrivacyCommitmentActivationTime(ctx); err != nil {
+		status.PrivacyCommitmentError = err.Error()
+	} else if ok {
+		status.PrivacyCommitmentTime = activationTime
+		if status.LatestTimestamp >= activationTime {
+			status.PrivacyCommitmentActive = true
+			status.PrivacyCommitmentSource = "node-config"
+		}
+	}
+	if active, err := p.rpc.PrivacyCommitmentActive(ctx); err != nil {
+		if status.PrivacyCommitmentError == "" {
+			status.PrivacyCommitmentError = err.Error()
+		}
+	} else {
+		status.PrivacyCommitmentActive = active
+		status.PrivacyCommitmentSource = "rpc"
+		status.PrivacyCommitmentError = ""
+	}
+
+	if isValidAddress(p.cfg.PoolWallet) {
+		if algorithm, err := p.rpc.AccountAlgorithm(ctx, p.cfg.PoolWallet); err != nil {
+			status.PoolWalletAlgorithmError = err.Error()
+		} else {
+			status.PoolWalletAlgorithm = algorithm
+		}
+	}
+	if status.QuantumResistantActive {
+		status.PayoutTxType = pqTxTypeHex
+	}
+
+	var blockers []string
+	if status.PrivacyCommitmentActive {
+		blockers = append(blockers, privacyTransparentPayoutBlockReason)
+	}
+	if status.QuantumResistantActive {
+		switch {
+		case status.PoolWalletAlgorithm == pqAlgorithmMLDSA87:
+		case status.PoolWalletAlgorithm != "":
+			blockers = append(blockers, fmt.Sprintf("quantum-resistant fork is active; pool wallet uses %s, expected %s", status.PoolWalletAlgorithm, pqAlgorithmMLDSA87))
+		case p.cfg.PoolWalletPassword != "" && status.PoolWalletAlgorithmError != "":
+			blockers = append(blockers, "quantum-resistant fork is active; cannot verify pool wallet algorithm: "+status.PoolWalletAlgorithmError)
+		}
+	}
+	if len(blockers) > 0 {
+		status.PayoutReady = false
+		status.PayoutBlockedReason = strings.Join(blockers, "; ")
+	}
+	return status
 }
 
 func (p *Pool) serveHTTP(ctx context.Context) error {
@@ -1244,6 +1375,7 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 	work := p.work
 	connectedSessions, authorizedSessions := p.sessionCountsLocked()
 	p.mu.RUnlock()
+	network := p.networkStatus(context.Background())
 
 	resp := map[string]any{
 		"poolName":           p.cfg.PoolName,
@@ -1269,6 +1401,7 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 		"balances":           balances,
 		"pendingBalances":    pendingBalances,
 		"payments":           payments,
+		"network":            network,
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -1312,6 +1445,7 @@ func (p *Pool) writeUserStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	work := p.work
 	p.mu.RUnlock()
+	network := p.networkStatus(r.Context())
 
 	resp := map[string]any{
 		"poolName":            p.cfg.PoolName,
@@ -1331,6 +1465,7 @@ func (p *Pool) writeUserStatus(w http.ResponseWriter, r *http.Request) {
 		"work":                work,
 		"minPayoutAntd":       p.cfg.MinPayoutAntd,
 		"maxPayoutPerTxAntd":  p.cfg.MaxPayoutPerTxAntd,
+		"network":             network,
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -1360,6 +1495,7 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 	} else {
 		daemonCoinbase = normalizeAddress(coinbase)
 	}
+	network := p.networkStatus(r.Context())
 
 	poolWalletBalance := map[string]any{}
 	if latestWei, latestBlock, err := p.rpc.ConfirmedBalance(r.Context(), p.cfg.PoolWallet, 0); err != nil {
@@ -1401,7 +1537,7 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 			nextAmount := round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd))
 			poolWalletBalance["nextPayoutWallet"] = wallet
 			poolWalletBalance["nextPayoutAntd"] = nextAmount
-			feeWei, err := p.rpc.PaymentFee(r.Context(), p.cfg.PoolWallet, wallet, nextAmount)
+			feeWei, err := p.rpc.PaymentFee(r.Context(), p.cfg.PoolWallet, wallet, nextAmount, network.PayoutTxType)
 			if err != nil {
 				if isInsufficientFundsError(err) {
 					poolWalletBalance["lowBalance"] = true
@@ -1425,6 +1561,11 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			break
 		}
+	}
+	if !network.PayoutReady {
+		poolWalletBalance["payoutBlocked"] = true
+		poolWalletBalance["lowBalance"] = true
+		poolWalletBalance["payoutStatus"] = network.PayoutBlockedReason
 	}
 
 	redisInfo := map[string]any{
@@ -1480,6 +1621,7 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 		"balances":                       balances,
 		"pendingBalances":                pendingBalances,
 		"payments":                       payments,
+		"network":                        network,
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -1604,6 +1746,61 @@ func (r *RPCClient) BlockNumber(ctx context.Context) (uint64, error) {
 	return parseUintFlexible(blockHex), nil
 }
 
+func (r *RPCClient) LatestHeader(ctx context.Context) (RPCHeader, error) {
+	var header struct {
+		Number    string `json:"number"`
+		Timestamp string `json:"timestamp"`
+	}
+	if err := r.call(ctx, "eth_getHeaderByNumber", []any{"latest"}, &header); err != nil {
+		if fallbackErr := r.call(ctx, "eth_getBlockByNumber", []any{"latest", false}, &header); fallbackErr != nil {
+			return RPCHeader{}, fmt.Errorf("eth_getHeaderByNumber failed: %w; eth_getBlockByNumber failed: %v", err, fallbackErr)
+		}
+	}
+	if header.Number == "" || header.Timestamp == "" {
+		return RPCHeader{}, errors.New("latest header response missing number or timestamp")
+	}
+	return RPCHeader{Number: parseUintFlexible(header.Number), Timestamp: parseUintFlexible(header.Timestamp)}, nil
+}
+
+func (r *RPCClient) PrivacyCommitmentActivationTime(ctx context.Context) (uint64, bool, error) {
+	var raw json.RawMessage
+	if err := r.call(ctx, "tkmprivacy_commitmentActivationTime", []any{}, &raw); err != nil {
+		return 0, false, err
+	}
+	if len(raw) == 0 || string(raw) == "null" {
+		return 0, false, nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return parseUintFlexible(text), true, nil
+	}
+	var number uint64
+	if err := json.Unmarshal(raw, &number); err == nil {
+		return number, true, nil
+	}
+	return 0, false, fmt.Errorf("invalid privacy activation time result %s", string(raw))
+}
+
+func (r *RPCClient) PrivacyCommitmentActive(ctx context.Context) (bool, error) {
+	var active bool
+	if err := r.call(ctx, "tkmprivacy_commitmentActive", []any{}, &active); err != nil {
+		return false, err
+	}
+	return active, nil
+}
+
+func (r *RPCClient) AccountAlgorithm(ctx context.Context, address string) (string, error) {
+	address = normalizeAddress(address)
+	if !isValidAddress(address) {
+		return "", fmt.Errorf("invalid account address %q", address)
+	}
+	var algorithm string
+	if err := r.call(ctx, "tkm_accountAlgorithm", []any{address}, &algorithm); err != nil {
+		return "", err
+	}
+	return algorithm, nil
+}
+
 func (r *RPCClient) Coinbase(ctx context.Context) (string, error) {
 	var coinbase string
 	if err := r.call(ctx, "eth_coinbase", []any{}, &coinbase); err != nil {
@@ -1663,7 +1860,7 @@ func (r *RPCClient) ConfirmedBalance(ctx context.Context, address string, confir
 	return balance, confirmed, nil
 }
 
-func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd float64, passphrase string) (string, error) {
+func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd float64, passphrase string, txType string) (string, error) {
 	from = normalizeAddress(from)
 	to = normalizeAddress(to)
 	if !isValidAddress(from) {
@@ -1672,7 +1869,7 @@ func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd
 	if !isValidAddress(to) {
 		return "", fmt.Errorf("invalid payout to address %q", to)
 	}
-	txArgs := map[string]any{"from": from, "to": to, "value": antdToWeiHex(amountAntd)}
+	txArgs := paymentTxArgs(from, to, amountAntd, txType)
 	var tx string
 	if passphrase != "" {
 		err := r.call(ctx, "tkm_sendTransactionWithPassphrase", []any{txArgs, passphrase}, &tx)
@@ -1682,7 +1879,7 @@ func (r *RPCClient) SendPayment(ctx context.Context, from, to string, amountAntd
 	return tx, err
 }
 
-func (r *RPCClient) PaymentFee(ctx context.Context, from, to string, amountAntd float64) (*big.Int, error) {
+func (r *RPCClient) PaymentFee(ctx context.Context, from, to string, amountAntd float64, txType string) (*big.Int, error) {
 	from = normalizeAddress(from)
 	to = normalizeAddress(to)
 	if !isValidAddress(from) {
@@ -1691,7 +1888,7 @@ func (r *RPCClient) PaymentFee(ctx context.Context, from, to string, amountAntd 
 	if !isValidAddress(to) {
 		return nil, fmt.Errorf("invalid payout to address %q", to)
 	}
-	txArgs := map[string]any{"from": from, "to": to, "value": antdToWeiHex(amountAntd)}
+	txArgs := paymentTxArgs(from, to, amountAntd, txType)
 	var gasHex string
 	if err := r.callWithStateRetry(ctx, "eth_estimateGas", []any{txArgs}, &gasHex); err != nil {
 		return nil, err
@@ -1709,6 +1906,14 @@ func (r *RPCClient) PaymentFee(ctx context.Context, from, to string, amountAntd 
 		return nil, fmt.Errorf("invalid gas price result %q", gasPriceHex)
 	}
 	return new(big.Int).Mul(gas, gasPrice), nil
+}
+
+func paymentTxArgs(from, to string, amountAntd float64, txType string) map[string]any {
+	txArgs := map[string]any{"from": from, "to": to, "value": antdToWeiHex(amountAntd)}
+	if txType != "" {
+		txArgs["type"] = txType
+	}
+	return txArgs
 }
 
 func isInsufficientFundsError(err error) bool {
@@ -1771,8 +1976,8 @@ func digestMeetsTarget(digestHex, targetHex string) bool {
 
 func parseUintFlexible(s string) uint64 {
 	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "0x") {
-		v, _ := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
+	if len(s) >= 2 && strings.EqualFold(s[:2], "0x") {
+		v, _ := strconv.ParseUint(s[2:], 16, 64)
 		return v
 	}
 	v, _ := strconv.ParseUint(s, 10, 64)
@@ -1781,8 +1986,8 @@ func parseUintFlexible(s string) uint64 {
 
 func parseBigFlexible(s string) (*big.Int, bool) {
 	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "0x") {
-		return new(big.Int).SetString(strings.TrimPrefix(s, "0x"), 16)
+	if len(s) >= 2 && strings.EqualFold(s[:2], "0x") {
+		return new(big.Int).SetString(s[2:], 16)
 	}
 	return new(big.Int).SetString(s, 10)
 }
@@ -1798,7 +2003,7 @@ const indexHTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{POOL_NAME}}</title>
   <style>
-    :root { color-scheme: light; --bg:#f7f8fb; --ink:#141821; --muted:#5b6472; --line:#d9dee7; --panel:#ffffff; --green:#12805c; --red:#b42318; --blue:#1b5fc1; }
+    :root { color-scheme: light; --bg:#f7f8fb; --ink:#141821; --muted:#5b6472; --line:#d9dee7; --panel:#ffffff; --green:#12805c; --red:#b42318; --orange:#9a5b00; --blue:#1b5fc1; }
     * { box-sizing: border-box; }
     body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
     header { background:#111827; color:white; padding:22px 28px; display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
@@ -1819,6 +2024,7 @@ const indexHTML = `<!doctype html>
     button:disabled { opacity:.55; cursor:wait; }
     .ok { color:var(--green); font-weight:700; }
     .bad { color:var(--red); font-weight:700; }
+    .warn { color:var(--orange); font-weight:700; }
     .muted { color:var(--muted); }
     .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .pager { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; flex-wrap:wrap; }
@@ -1845,6 +2051,7 @@ const indexHTML = `<!doctype html>
       <div class="panel metric"><div class="label">Connected Miners</div><div class="value" id="workers">0</div></div>
       <div class="panel metric"><div class="label">Current Height</div><div class="value" id="height">0</div></div>
       <div class="panel metric"><div class="label">Payment Method</div><div class="value" id="payment">PROP</div></div>
+      <div class="panel metric"><div class="label">Network Mode</div><div class="value" id="networkMode">loading</div></div>
     </div>
 
     <section class="section panel">
@@ -1870,6 +2077,7 @@ const indexHTML = `<!doctype html>
           <tr><th>Minimum Payout</th><td id="minPayout"></td></tr>
           <tr><th>Pool Fee</th><td id="fee"></td></tr>
           <tr><th>Auto Pay</th><td id="autoPay"></td></tr>
+          <tr><th>Payout Gate</th><td id="payoutGate"></td></tr>
         </tbody>
       </table>
       <h2 style="margin-top:18px">Balances</h2>
@@ -1895,6 +2103,16 @@ const indexHTML = `<!doctype html>
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
     const money = (v) => (Number(v || 0)).toFixed(8) + ' TKM';
     function txLink(hash) { return hash && explorerURL ? '<a href="' + explorerURL + '/tx/' + hash + '" target="_blank" rel="noopener">' + hash + '</a>' : (hash || '-'); }
+    function networkText(n) {
+      const parts = [];
+      if (n && n.quantumResistantActive) parts.push('PQ');
+      if (n && n.privacyCommitmentActive) parts.push('Privacy');
+      return parts.length ? parts.join(' + ') : 'Legacy';
+    }
+    function networkHTML(n) {
+      if (!n) return 'loading';
+      return '<span class="' + (n.payoutReady ? 'ok' : 'warn') + '">' + networkText(n) + '</span>';
+    }
     let explorerURL = '';
     function renderPayments() {
       const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
@@ -1913,6 +2131,7 @@ const indexHTML = `<!doctype html>
       $('workers').textContent = (s.authorizedSessions ?? s.connectedSessions ?? s.miners.length);
       $('height').textContent = s.work.height || 0;
       $('payment').textContent = s.paymentMode;
+      $('networkMode').innerHTML = networkHTML(s.network);
       $('stratum').textContent = s.stratum;
       $('minerUrl').textContent = 'stratum+tcp://' + s.stratum;
       $('poolWallet').textContent = s.poolWallet;
@@ -1921,6 +2140,7 @@ const indexHTML = `<!doctype html>
       $('minPayout').textContent = s.minPayoutAntd + ' TKM';
       $('fee').textContent = s.feePercent + '%';
       $('autoPay').innerHTML = s.autoPay ? '<span class="ok">enabled</span>' : '<span class="bad">disabled</span>';
+      $('payoutGate').innerHTML = s.network && s.network.payoutReady ? '<span class="ok">ready</span>' : '<span class="warn">' + ((s.network && s.network.payoutBlockedReason) || 'waiting for fork status') + '</span>';
       $('miners').innerHTML = s.miners.map(m => row([m.wallet, m.worker || '-', m.acceptedShares, m.rejectedShares, m.roundShares || 0, new Date(m.lastSeen).toLocaleString()])).join('') || row(['No workers connected', '', '', '', '', '']);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       document.getElementById("balances").innerHTML = wallets.map(w => row([w, money((s.balances || {})[w] || 0), money((s.pendingBalances || {})[w] || 0), money(((s.balances || {})[w] || 0) + ((s.pendingBalances || {})[w] || 0))])).join("") || row(["No balances yet", money(0), money(0), money(0)]);
@@ -1949,7 +2169,7 @@ const userHTML = `<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{POOL_NAME}} Miner</title>
   <style>
-    :root { color-scheme: light; --bg:#f6f8fb; --ink:#141821; --muted:#5b6472; --line:#d8dee8; --panel:#fff; --green:#12715b; --red:#b42318; --blue:#174ea6; }
+    :root { color-scheme: light; --bg:#f6f8fb; --ink:#141821; --muted:#5b6472; --line:#d8dee8; --panel:#fff; --green:#12715b; --red:#b42318; --orange:#9a5b00; --blue:#174ea6; }
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; }
     header { background:#151922; color:#fff; padding:20px 28px; display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
@@ -1968,7 +2188,9 @@ const userHTML = `<!doctype html>
     th, td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
     th { color:var(--muted); font-size:12px; text-transform:uppercase; }
     .muted { color:var(--muted); }
+    .ok { color:var(--green); font-weight:750; }
     .bad { color:var(--red); font-weight:750; }
+    .warn { color:var(--orange); font-weight:750; }
     @media (max-width: 820px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } main { padding:16px; } }
     @media (max-width: 540px) { .grid { grid-template-columns:1fr; } }
   </style>
@@ -1991,6 +2213,7 @@ const userHTML = `<!doctype html>
       <div class="panel metric"><div class="label">Pending Round</div><div class="value" id="pending">0</div></div>
       <div class="panel metric"><div class="label">Paid</div><div class="value" id="paid">0</div></div>
       <div class="panel metric"><div class="label">Shares</div><div class="value" id="shares">0</div></div>
+      <div class="panel metric"><div class="label">Network</div><div class="value" id="networkMode">loading</div></div>
     </div>
     <section class="panel">
       <h2>Workers</h2>
@@ -2010,6 +2233,16 @@ const userHTML = `<!doctype html>
     let paymentsRows = [];
     function row(cells) { return '<tr>' + cells.map(v => '<td>' + String(v ?? '') + '</td>').join('') + '</tr>'; }
     function txLink(hash) { return hash && explorerURL ? '<a href="' + explorerURL + '/tx/' + hash + '" target="_blank" rel="noopener">' + hash + '</a>' : (hash || '-'); }
+    function networkText(n) {
+      const parts = [];
+      if (n && n.quantumResistantActive) parts.push('PQ');
+      if (n && n.privacyCommitmentActive) parts.push('Privacy');
+      return parts.length ? parts.join(' + ') : 'Legacy';
+    }
+    function networkHTML(n) {
+      if (!n) return 'loading';
+      return '<span class="' + (n.payoutReady ? 'ok' : 'warn') + '">' + networkText(n) + '</span>';
+    }
     let explorerURL = '';
     function renderPayments() {
       const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
@@ -2039,6 +2272,7 @@ const userHTML = `<!doctype html>
       $('pending').textContent = money(s.pendingRoundBalance);
       $('paid').textContent = money(s.totalPaid);
       $('shares').textContent = String((s.acceptedShares || 0) + ' / ' + (s.rejectedShares || 0));
+      $('networkMode').innerHTML = networkHTML(s.network);
       $('workers').innerHTML = (s.workers || []).map(w => row([w.worker || '-', w.acceptedShares, w.rejectedShares, w.roundShares || 0, new Date(w.lastSeen).toLocaleString()])).join('') || row(['No workers found', '', '', '', '']);
       paymentsRows = (s.payments || []).slice().reverse();
       renderPayments();
@@ -2108,6 +2342,7 @@ const adminHTML = `<!doctype html>
       <div class="panel metric"><div class="label">Confirmed Spendable</div><div class="value" id="spendableBalance">loading</div><div class="muted" id="confirmedBlock"></div></div>
       <div class="panel metric"><div class="label">Miner Balance Owed</div><div class="value" id="owedBalance">0</div><div class="muted" id="pendingBalance"></div></div>
       <div class="panel metric"><div class="label">Redis State</div><div class="value" id="redisStatus">loading</div><div class="muted" id="redisBytes"></div></div>
+      <div class="panel metric"><div class="label">Fork Mode</div><div class="value" id="forkMode">loading</div><div class="muted" id="payoutTxType"></div></div>
     </div>
 
     <section class="section split">
@@ -2154,6 +2389,16 @@ const adminHTML = `<!doctype html>
     let explorerURL = '';
     function kv(k, v) { return '<tr><th>' + k + '</th><td>' + String(v ?? '') + '</td></tr>'; }
     function errText(v) { return v ? '<span class="bad">' + String(v) + '</span>' : ''; }
+    function networkText(n) {
+      const parts = [];
+      if (n && n.quantumResistantActive) parts.push('PQ');
+      if (n && n.privacyCommitmentActive) parts.push('Privacy');
+      return parts.length ? parts.join(' + ') : 'Legacy';
+    }
+    function networkHTML(n) {
+      if (!n) return 'loading';
+      return '<span class="' + (n.payoutReady ? 'ok' : 'warn') + '">' + networkText(n) + '</span>';
+    }
     function renderPayments() {
       const totalPages = Math.max(1, Math.ceil(paymentsRows.length / paymentsPageSize));
       paymentsPage = Math.min(Math.max(0, paymentsPage), totalPages - 1);
@@ -2169,6 +2414,7 @@ const adminHTML = `<!doctype html>
       const s = await res.json();
       explorerURL = s.explorerURL || '';
       const b = s.poolWalletBalance || {};
+      const n = s.network || {};
       $('latestBalance').innerHTML = b.latestError ? errText(b.latestError) : money(b.latestAntd);
       $('latestBlock').textContent = b.latestBlock !== undefined ? 'block ' + b.latestBlock : '';
       $('spendableBalance').innerHTML = b.confirmedError ? errText(b.confirmedError) : (b.lowBalance ? '<span class="warn">' + money(b.spendableAntd) + '</span>' : money(b.spendableAntd));
@@ -2177,10 +2423,12 @@ const adminHTML = `<!doctype html>
       $('pendingBalance').textContent = 'pending round ' + money(s.totalPendingRoundAntd);
       $('redisStatus').innerHTML = s.redis && s.redis.ok ? '<span class="ok">online</span>' : '<span class="bad">offline</span>';
       $('redisBytes').textContent = s.redis && s.redis.ok ? String(s.redis.stateBytes || 0) + ' bytes saved' : ((s.redis && s.redis.error) || '');
+      $('forkMode').innerHTML = networkHTML(n);
+      $('payoutTxType').textContent = 'payout tx type ' + (n.payoutTxType || 'default');
       const payoutStatus = b.confirmedError ? errText(b.confirmedError) : (b.lowBalance ? '<span class="warn">' + (b.payoutStatus || 'low pool wallet balance') + '</span>' : '<span class="ok">' + (b.payoutStatus || 'ready') + '</span>');
-      $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Payout status', payoutStatus) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Pending balance', b.pendingError ? errText(b.pendingError) : (b.pendingAntd !== undefined ? money(b.pendingAntd) : '-')) + kv('Usable balance', b.availableAntd !== undefined ? money(b.availableAntd) : '-') + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Total miner balance owed', b.totalOwedAntd !== undefined ? money(b.totalOwedAntd) : money(s.totalConfirmedMinerBalanceAntd)) + kv('Estimated next tx fee', b.estimatedTxFeeAntd !== undefined ? money(b.estimatedTxFeeAntd) : (b.feeEstimateError ? errText(b.feeEstimateError) : '-')) + kv('Spendable after next fee', b.spendableAfterFeeAntd !== undefined ? money(b.spendableAfterFeeAntd) : '-') + kv('Next payout', b.nextPayoutAntd !== undefined ? money(b.nextPayoutAntd) + ' to ' + b.nextPayoutWallet : '-') + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
+      $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Payout status', payoutStatus) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Pending balance', b.pendingError ? errText(b.pendingError) : (b.pendingAntd !== undefined ? money(b.pendingAntd) : '-')) + kv('Usable balance', b.availableAntd !== undefined ? money(b.availableAntd) : '-') + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Total miner balance owed', b.totalOwedAntd !== undefined ? money(b.totalOwedAntd) : money(s.totalConfirmedMinerBalanceAntd)) + kv('Estimated next tx fee', b.estimatedTxFeeAntd !== undefined ? money(b.estimatedTxFeeAntd) : (b.feeEstimateError ? errText(b.feeEstimateError) : '-')) + kv('Spendable after next fee', b.spendableAfterFeeAntd !== undefined ? money(b.spendableAfterFeeAntd) : '-') + kv('Next payout', b.nextPayoutAntd !== undefined ? money(b.nextPayoutAntd) + ' to ' + b.nextPayoutWallet : '-') + kv('Payout tx type', n.payoutTxType || 'default') + kv('Pool wallet algorithm', n.poolWalletAlgorithm || (n.poolWalletAlgorithmError ? errText(n.poolWalletAlgorithmError) : '-')) + kv('Quantum active', yesno(n.quantumResistantActive)) + kv('Privacy commitments active', yesno(n.privacyCommitmentActive)) + kv('Payout gate', n.payoutReady ? '<span class="ok">ready</span>' : '<span class="warn">' + (n.payoutBlockedReason || 'blocked') + '</span>') + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
       $('runtimeRows').innerHTML = kv('Public URL', s.publicURL) + kv('HTTP bind', s.http) + kv('Stratum public', s.stratum) + kv('Stratum bind', s.stratumBind) + kv('Explorer', s.explorerURL || '-') + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Connected miners', s.authorizedSessions ?? s.connectedSessions ?? 0) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
-      $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Recent payment records', s.paymentCount);
+      $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Privacy commitment time', n.privacyCommitmentTime ? new Date(Number(n.privacyCommitmentTime) * 1000).toISOString() : '-') + kv('Quantum-resistant time', n.quantumResistantTime ? new Date(Number(n.quantumResistantTime) * 1000).toISOString() : '-') + kv('Recent payment records', s.paymentCount);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       $('balances').innerHTML = wallets.map(w => {
         const confirmed = (s.balances || {})[w] || 0;

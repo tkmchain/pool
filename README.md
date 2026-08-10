@@ -6,6 +6,7 @@ It provides:
 
 - Stratum TCP listener for external miners.
 - JSON-RPC polling against a synced `gtkm` node using `miner_getWork` by default. `randomx_getWork` and auto fallback are also configurable.
+- Fork-aware TKM privacy and post-quantum payout checks.
 - Share accounting by wallet address.
 - Payment ledger with proportional payout calculation.
 - Optional guarded payout submission through the node RPC.
@@ -25,7 +26,7 @@ Run a full Tkmchain node with RandomX/miner APIs enabled:
 
 ```sh
 gtkm --syncmode=full --http --http.addr 127.0.0.1 \
-  --http.api eth,net,web3,miner,randomx,tkm \
+  --http.api eth,net,web3,miner,randomx,tkm,tkmprivacy \
   --mine --miner.threads=1 --miner.etherbase=0xYourPoolWallet
 ```
 
@@ -73,6 +74,19 @@ If you want hwloc CPU topology support, install `libhwloc-dev` and remove `-DWIT
 The pool accounts the configured `blockRewardAntd` proportionally when the daemon accepts a submitted block candidate. Balances and payment history are persisted only to Redis. On startup the pool connects to Redis and writes an empty state if the key does not exist, so Redis must be running before the pool starts. Timer autopay checks the pool wallet balance at `eth_blockNumber - paymentConfirmations`. Payouts triggered by a found block use the latest balance immediately. Both paths only send payouts that fit inside the spendable pool balance after `payoutReserveAntd` is kept aside. Payouts are chunked: each transaction sends at most `maxPayoutPerTxAntd`, and if confirmed spendable pool balance is smaller the pool sends the available amount as long as it is at least `minPayoutAntd`. Failed payout transactions are recorded in the payment list and the miner balance is kept for the next run.
 
 Automatic payment broadcasting is disabled by default. To enable it, set `autoPay` to `true`, set `minPayoutAntd` and `maxPayoutPerTxAntd`, and make sure `poolWallet` is a funded hot wallet. For password mode, set `poolWalletPassword`; the pool calls `tkm_sendTransactionWithPassphrase` for each payout transaction, so the wallet is not globally unlocked. If `poolWalletPassword` is empty, use Clef or another node signer with `eth_sendTransaction` instead.
+
+For the production privacy/PQ hardfork at `2026-08-10 06:00:00 UTC`, keep these fields aligned with the chain:
+
+```json
+{
+  "privacyCommitmentTime": 1786341600,
+  "quantumResistantTime": 1786341600
+}
+```
+
+After `quantumResistantTime`, payout transactions are sent as TKM PQ transaction type `0x6`. The pool verifies the local `poolWallet` keystore with `tkm_accountAlgorithm` and expects `ML-DSA-87` when `poolWalletPassword` is configured.
+
+After privacy commitments are active, transparent payouts are held instead of broadcast because the chain rejects non-`TKMSHIELD1` user transactions. Mining and share accounting continue, block rewards still accrue to the configured etherbase, and balances remain in Redis until a real shielded payout prover is configured for pool spending.
 
 Redis setup for payment state:
 
@@ -151,7 +165,7 @@ clef --configdir ~/.clef-tkm-egypt \
 ./gtkm --egypt --syncmode=full \
   --signer http://127.0.0.1:8550 \
   --http --http.addr 127.0.0.1 --http.port 8545 \
-  --http.api eth,net,web3,miner,randomx,tkm \
+  --http.api eth,net,web3,miner,randomx,tkm,tkmprivacy \
   --mine --miner.etherbase=0xYourPoolWallet
 ```
 
@@ -173,6 +187,8 @@ clef --configdir ~/.clef-tkm-egypt \
   "paymentConfirmations": 0,
   "payoutReserveAntd": 0.1,
   "rpcTimeoutSeconds": 60,
+  "privacyCommitmentTime": 1786341600,
+  "quantumResistantTime": 1786341600,
   "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 }
 ```

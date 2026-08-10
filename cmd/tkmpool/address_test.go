@@ -94,3 +94,32 @@ func TestApplyPayoutStateMergesSameAddressWithDifferentCase(t *testing.T) {
 		t.Fatalf("merged miner = %#v, shares/lastSeen not merged correctly", miner)
 	}
 }
+
+func TestPaymentTxArgsIncludesPQTkmType(t *testing.T) {
+	args := paymentTxArgs(
+		"0xf03a2a24c8926dba5a44301c751aec047b60b0a6",
+		"0x4441d6fed0836b77a503e0b2788bfed6fd8c23a8",
+		1.25,
+		pqTxTypeHex,
+	)
+
+	if args["type"] != pqTxTypeHex {
+		t.Fatalf("payment tx type = %v, want %s", args["type"], pqTxTypeHex)
+	}
+	if args["value"] != "0x1158e460913d0000" {
+		t.Fatalf("payment value = %v", args["value"])
+	}
+}
+
+func TestPaymentTxArgsOmitsLegacyType(t *testing.T) {
+	args := paymentTxArgs(
+		"0xf03a2a24c8926dba5a44301c751aec047b60b0a6",
+		"0x4441d6fed0836b77a503e0b2788bfed6fd8c23a8",
+		1,
+		"",
+	)
+
+	if _, ok := args["type"]; ok {
+		t.Fatalf("legacy payment tx args should not include type: %#v", args)
+	}
+}
