@@ -25,6 +25,8 @@
   "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   "privacyCommitmentTime": 1786341600,
   "quantumResistantTime": 1786341600,
+  "shieldedPayoutProverURL": "",
+  "shieldedPayoutProverToken": "",
   "publicURL": "http://127.0.0.1:33230",
   "explorerURL": "https://block.tkmchain.site",
   "publicStratum": "127.0.0.1:33330"

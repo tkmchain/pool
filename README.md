@@ -88,6 +88,64 @@ After `quantumResistantTime`, payout transactions are sent as TKM PQ transaction
 
 After privacy commitments are active, transparent payouts are held instead of broadcast because the chain rejects non-`TKMSHIELD1` user transactions. Mining and share accounting continue, block rewards still accrue to the configured etherbase, and balances remain in Redis until a real shielded payout prover is configured for pool spending.
 
+To enable shielded payouts, run a separate prover service on a private host that has the shielded note wallet and proving key. Then set these pool config fields and restart the pool:
+
+```json
+{
+  "shieldedPayoutProverURL": "http://127.0.0.1:8787/payout",
+  "shieldedPayoutProverToken": "change-this-token"
+}
+```
+
+The pool sends one `POST` per payout:
+
+```json
+{
+  "requestId": "stable-idempotency-key",
+  "poolWallet": "0xYourPoolWallet",
+  "to": "0xMinerPayoutWallet",
+  "amountAntd": 5,
+  "amountWei": "0x4563918244f40000",
+  "payoutTxType": "0x6",
+  "privacyCommitmentTime": 1786341600,
+  "quantumResistantTime": 1786341600,
+  "createdAt": "2026-08-11T00:00:00Z"
+}
+```
+
+The active shielded spend circuit constrains note values to 64-bit wei. In shielded mode the pool automatically chunks any larger miner balance into per-transaction payouts of at most `18.44674407` TKM, even if `maxPayoutPerTxAntd` is configured higher. Later payout cycles continue paying the remaining balance.
+
+The pool checks `GET /healthz` on the configured prover host before attempting shielded payouts. If the prover is reachable but has no spendable shielded notes, `/api/status` reports:
+
+```text
+shielded payout prover has no spendable shielded notes
+```
+
+That means the prover service and proving key can be healthy while payout liquidity is still missing. Fund the prover by importing real shielded notes with known on-chain commitments and Merkle witnesses; do not create synthetic local notes.
+
+For pool-owned liquidity, use the prover's authenticated deposit endpoint instead of sending TKM to mainking:
+
+```sh
+curl -sS http://127.0.0.1:8787/deposit \
+  -H "Authorization: Bearer <shieldedPayoutProverToken>" \
+  -H "Content-Type: application/json" \
+  -d '{"requestId":"pool-liquidity-001","amountAntd":5}'
+```
+
+The deposit locks transparent TKM in `ShieldedPoolAddress`, proves that the deposited value is represented by shielded output commitments, and imports the resulting note into the prover's `notes.json`.
+
+Use a stable `requestId` only for retries of the same deposit. Reusing a deposit `requestId` returns the recorded transaction instead of creating a second funding transaction.
+
+The TKM node behind the prover must run the deposit-capable shielded verifier. Older node binaries reject these deposit proofs.
+
+If `shieldedPayoutProverToken` is set, the pool sends `Authorization: Bearer <token>`. The prover must build a real `TKMSHIELD1` envelope, sign and submit the transaction to the TKM node, then return:
+
+```json
+{ "txHash": "0x..." }
+```
+
+Only after a valid 32-byte transaction hash is returned does the pool mark the payout as `sent` and deduct the miner's Redis balance. If the prover is down or returns an error, the payout remains owed and is retried with the same `requestId` sequence until a sent payout is recorded. The prover should therefore persist request IDs and return the same hash for duplicate requests.
+
 Redis setup for payment state:
 
 ```sh

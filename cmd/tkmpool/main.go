@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -27,35 +28,37 @@ import (
 )
 
 type Config struct {
-	PoolName               string  `json:"poolName"`
-	ListenHTTP             string  `json:"listenHTTP"`
-	PublicURL              string  `json:"publicURL"`
-	ExplorerURL            string  `json:"explorerURL"`
-	ListenStratum          string  `json:"listenStratum"`
-	PublicStratum          string  `json:"publicStratum"`
-	NodeRPC                string  `json:"nodeRPC"`
-	WorkMethod             string  `json:"workMethod"`
-	PoolWallet             string  `json:"poolWallet"`
-	PoolWalletPassword     string  `json:"poolWalletPassword"`
-	AdminPassword          string  `json:"adminPassword"`
-	RedisAddr              string  `json:"redisAddr"`
-	RedisPassword          string  `json:"redisPassword"`
-	RedisDB                int     `json:"redisDB"`
-	RedisStateKey          string  `json:"redisStateKey"`
-	BlockRewardAntd        float64 `json:"blockRewardAntd"`
-	NetworkFeePercent      float64 `json:"networkFeePercent"`
-	MinPayoutAntd          float64 `json:"minPayoutAntd"`
-	MaxPayoutPerTxAntd     float64 `json:"maxPayoutPerTxAntd"`
-	PaymentMode            string  `json:"paymentMode"`
-	AutoPay                bool    `json:"autoPay"`
-	PaymentIntervalSeconds int     `json:"paymentIntervalSeconds"`
-	PaymentConfirmations   int     `json:"paymentConfirmations"`
-	PayoutReserveAntd      float64 `json:"payoutReserveAntd"`
-	RPCTimeoutSeconds      int     `json:"rpcTimeoutSeconds"`
-	WorkPollIntervalMs     int     `json:"workPollIntervalMs"`
-	ShareTarget            string  `json:"shareTarget"`
-	PrivacyCommitmentTime  uint64  `json:"privacyCommitmentTime"`
-	QuantumResistantTime   uint64  `json:"quantumResistantTime"`
+	PoolName                  string  `json:"poolName"`
+	ListenHTTP                string  `json:"listenHTTP"`
+	PublicURL                 string  `json:"publicURL"`
+	ExplorerURL               string  `json:"explorerURL"`
+	ListenStratum             string  `json:"listenStratum"`
+	PublicStratum             string  `json:"publicStratum"`
+	NodeRPC                   string  `json:"nodeRPC"`
+	WorkMethod                string  `json:"workMethod"`
+	PoolWallet                string  `json:"poolWallet"`
+	PoolWalletPassword        string  `json:"poolWalletPassword"`
+	AdminPassword             string  `json:"adminPassword"`
+	RedisAddr                 string  `json:"redisAddr"`
+	RedisPassword             string  `json:"redisPassword"`
+	RedisDB                   int     `json:"redisDB"`
+	RedisStateKey             string  `json:"redisStateKey"`
+	BlockRewardAntd           float64 `json:"blockRewardAntd"`
+	NetworkFeePercent         float64 `json:"networkFeePercent"`
+	MinPayoutAntd             float64 `json:"minPayoutAntd"`
+	MaxPayoutPerTxAntd        float64 `json:"maxPayoutPerTxAntd"`
+	PaymentMode               string  `json:"paymentMode"`
+	AutoPay                   bool    `json:"autoPay"`
+	PaymentIntervalSeconds    int     `json:"paymentIntervalSeconds"`
+	PaymentConfirmations      int     `json:"paymentConfirmations"`
+	PayoutReserveAntd         float64 `json:"payoutReserveAntd"`
+	RPCTimeoutSeconds         int     `json:"rpcTimeoutSeconds"`
+	WorkPollIntervalMs        int     `json:"workPollIntervalMs"`
+	ShareTarget               string  `json:"shareTarget"`
+	PrivacyCommitmentTime     uint64  `json:"privacyCommitmentTime"`
+	QuantumResistantTime      uint64  `json:"quantumResistantTime"`
+	ShieldedPayoutProverURL   string  `json:"shieldedPayoutProverURL"`
+	ShieldedPayoutProverToken string  `json:"shieldedPayoutProverToken"`
 }
 
 type PayoutState struct {
@@ -95,20 +98,26 @@ type RPCHeader struct {
 }
 
 type NetworkStatus struct {
-	LatestBlock              uint64 `json:"latestBlock"`
-	LatestTimestamp          uint64 `json:"latestTimestamp"`
-	HeadError                string `json:"headError,omitempty"`
-	PrivacyCommitmentTime    uint64 `json:"privacyCommitmentTime"`
-	PrivacyCommitmentActive  bool   `json:"privacyCommitmentActive"`
-	PrivacyCommitmentSource  string `json:"privacyCommitmentSource"`
-	PrivacyCommitmentError   string `json:"privacyCommitmentError,omitempty"`
-	QuantumResistantTime     uint64 `json:"quantumResistantTime"`
-	QuantumResistantActive   bool   `json:"quantumResistantActive"`
-	PoolWalletAlgorithm      string `json:"poolWalletAlgorithm,omitempty"`
-	PoolWalletAlgorithmError string `json:"poolWalletAlgorithmError,omitempty"`
-	PayoutTxType             string `json:"payoutTxType"`
-	PayoutReady              bool   `json:"payoutReady"`
-	PayoutBlockedReason      string `json:"payoutBlockedReason,omitempty"`
+	LatestBlock                    uint64 `json:"latestBlock"`
+	LatestTimestamp                uint64 `json:"latestTimestamp"`
+	HeadError                      string `json:"headError,omitempty"`
+	PrivacyCommitmentTime          uint64 `json:"privacyCommitmentTime"`
+	PrivacyCommitmentActive        bool   `json:"privacyCommitmentActive"`
+	PrivacyCommitmentSource        string `json:"privacyCommitmentSource"`
+	PrivacyCommitmentError         string `json:"privacyCommitmentError,omitempty"`
+	QuantumResistantTime           uint64 `json:"quantumResistantTime"`
+	QuantumResistantActive         bool   `json:"quantumResistantActive"`
+	PoolWalletAlgorithm            string `json:"poolWalletAlgorithm,omitempty"`
+	PoolWalletAlgorithmError       string `json:"poolWalletAlgorithmError,omitempty"`
+	ShieldedPayoutProverConfigured bool   `json:"shieldedPayoutProverConfigured"`
+	ShieldedPayoutsEnabled         bool   `json:"shieldedPayoutsEnabled"`
+	ShieldedPayoutProverReady      bool   `json:"shieldedPayoutProverReady"`
+	ShieldedPayoutProverError      string `json:"shieldedPayoutProverError,omitempty"`
+	ShieldedPayoutAvailableNotes   int    `json:"shieldedPayoutAvailableNotes"`
+	ShieldedPayoutMaxNoteWei       string `json:"shieldedPayoutMaxNoteWei,omitempty"`
+	PayoutTxType                   string `json:"payoutTxType"`
+	PayoutReady                    bool   `json:"payoutReady"`
+	PayoutBlockedReason            string `json:"payoutBlockedReason,omitempty"`
 }
 
 const (
@@ -116,6 +125,7 @@ const (
 	pqAlgorithmMLDSA87                  = "ML-DSA-87"
 	tkmPrivacyQuantumActivationUnix     = uint64(1786341600) // 2026-08-10 06:00:00 UTC
 	privacyTransparentPayoutBlockReason = "privacy commitments are active; transparent pool payouts are disabled until a shielded payout prover is configured"
+	shieldedMaxPayoutPerTxAntd          = 18.44674407 // floor(MaxUint64 wei / 1e18) to the pool's 8 decimal places
 )
 
 type Pool struct {
@@ -239,6 +249,8 @@ func loadConfig(path string) (Config, error) {
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 	cfg.ExplorerURL = strings.TrimRight(cfg.ExplorerURL, "/")
+	cfg.ShieldedPayoutProverURL = strings.TrimSpace(cfg.ShieldedPayoutProverURL)
+	cfg.ShieldedPayoutProverToken = strings.TrimSpace(cfg.ShieldedPayoutProverToken)
 	if cfg.PublicStratum == "" {
 		cfg.PublicStratum = cfg.ListenStratum
 	}
@@ -1097,6 +1109,216 @@ func (p *Pool) recordPaymentStatuses(payments []Payment, status string) {
 	p.savePayoutStateLocked()
 }
 
+func (p *Pool) shieldedPayoutProverConfigured() bool {
+	return strings.TrimSpace(p.cfg.ShieldedPayoutProverURL) != ""
+}
+
+type ShieldedPayoutRequest struct {
+	RequestID             string    `json:"requestId"`
+	PoolWallet            string    `json:"poolWallet"`
+	To                    string    `json:"to"`
+	AmountAntd            float64   `json:"amountAntd"`
+	AmountWei             string    `json:"amountWei"`
+	PayoutTxType          string    `json:"payoutTxType,omitempty"`
+	PrivacyCommitmentTime uint64    `json:"privacyCommitmentTime"`
+	QuantumResistantTime  uint64    `json:"quantumResistantTime"`
+	CreatedAt             time.Time `json:"createdAt"`
+}
+
+type ShieldedPayoutResponse struct {
+	TxHash string `json:"txHash"`
+	Hash   string `json:"hash,omitempty"`
+	Status string `json:"status,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type ShieldedPayoutProverHealth struct {
+	OK                  bool   `json:"ok"`
+	PayoutReady         bool   `json:"payoutReady"`
+	HasSpendableNotes   bool   `json:"hasSpendableNotes"`
+	AvailableNoteCount  int    `json:"availableNoteCount"`
+	AvailableNoteMaxWei string `json:"availableNoteMaxWei"`
+	NoteInventoryError  string `json:"noteInventoryError"`
+	StartupError        string `json:"startupError"`
+}
+
+func (p *Pool) shieldedPayoutRequestID(payment Payment) string {
+	wallet := normalizeAddress(payment.Wallet)
+	sequence := 0
+
+	p.mu.RLock()
+	for _, existing := range p.payments {
+		if strings.EqualFold(normalizeAddress(existing.Wallet), wallet) && existing.Status == "sent" {
+			sequence++
+		}
+	}
+	p.mu.RUnlock()
+
+	payload := fmt.Sprintf("%s|%s|%s|%.8f|%d|shielded-payout", p.cfg.RedisStateKey, normalizeAddress(p.cfg.PoolWallet), wallet, round(payment.Amount), sequence)
+	sum := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(sum[:])
+}
+
+func effectiveShieldedPayoutAmount(amount float64) float64 {
+	amount = round(amount)
+	if amount <= 0 {
+		return 0
+	}
+	if amount > shieldedMaxPayoutPerTxAntd || antdToWeiInt(amount).BitLen() > 64 {
+		return shieldedMaxPayoutPerTxAntd
+	}
+	return amount
+}
+
+func effectiveShieldedPayoutAmountForNote(amount float64, maxNoteWeiText string) float64 {
+	amount = effectiveShieldedPayoutAmount(amount)
+	if amount <= 0 {
+		return 0
+	}
+	maxNoteWei, ok := parseBigFlexible(maxNoteWeiText)
+	if !ok || maxNoteWei.Sign() <= 0 {
+		return 0
+	}
+	maxNoteAntd := weiToAntdFloor(maxNoteWei)
+	if maxNoteAntd <= 0 {
+		return 0
+	}
+	amount = round(minFloat(amount, maxNoteAntd))
+	for amount > 0 && antdToWeiInt(amount).Cmp(maxNoteWei) > 0 {
+		amount = round(amount - 0.00000001)
+	}
+	return amount
+}
+
+func effectiveMaxPayoutPerTxAntd(maxPayout float64, shielded bool) float64 {
+	maxPayout = round(maxPayout)
+	if maxPayout <= 0 {
+		return 0
+	}
+	if shielded && (maxPayout > shieldedMaxPayoutPerTxAntd || antdToWeiInt(maxPayout).BitLen() > 64) {
+		return shieldedMaxPayoutPerTxAntd
+	}
+	return maxPayout
+}
+
+func shieldedPayoutHealthURL(endpoint string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid shielded payout prover URL %q", endpoint)
+	}
+	parsed.Path = "/healthz"
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String(), nil
+}
+
+func (p *Pool) shieldedPayoutProverHealth(ctx context.Context) (ShieldedPayoutProverHealth, error) {
+	endpoint, err := shieldedPayoutHealthURL(p.cfg.ShieldedPayoutProverURL)
+	if err != nil {
+		return ShieldedPayoutProverHealth{}, err
+	}
+	if p.rpc == nil || p.rpc.client == nil {
+		return ShieldedPayoutProverHealth{}, errors.New("shielded payout HTTP client is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return ShieldedPayoutProverHealth{}, err
+	}
+	if token := strings.TrimSpace(p.cfg.ShieldedPayoutProverToken); token != "" {
+		req.Header.Set("authorization", "Bearer "+token)
+	}
+	resp, err := p.rpc.client.Do(req)
+	if err != nil {
+		return ShieldedPayoutProverHealth{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return ShieldedPayoutProverHealth{}, fmt.Errorf("health returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out ShieldedPayoutProverHealth
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return ShieldedPayoutProverHealth{}, err
+	}
+	return out, nil
+}
+
+func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType string) (string, error) {
+	endpoint := strings.TrimSpace(p.cfg.ShieldedPayoutProverURL)
+	if endpoint == "" {
+		return "", errors.New("shielded payout prover URL is not configured")
+	}
+	if p.rpc == nil || p.rpc.client == nil {
+		return "", errors.New("shielded payout HTTP client is not configured")
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid shielded payout prover URL %q", endpoint)
+	}
+
+	to := normalizeAddress(payment.Wallet)
+	if !isValidAddress(to) {
+		return "", fmt.Errorf("invalid shielded payout address %q", payment.Wallet)
+	}
+	payment.Amount = effectiveShieldedPayoutAmount(payment.Amount)
+	if payment.Amount <= 0 {
+		return "", errors.New("shielded payout amount must be positive")
+	}
+	amountWei := antdToWeiInt(payment.Amount)
+	if amountWei.Sign() <= 0 || amountWei.BitLen() > 64 {
+		return "", fmt.Errorf("shielded payout amount %.8f exceeds uint64 wei circuit limit", payment.Amount)
+	}
+	reqBody, err := json.Marshal(ShieldedPayoutRequest{
+		RequestID:             p.shieldedPayoutRequestID(payment),
+		PoolWallet:            normalizeAddress(p.cfg.PoolWallet),
+		To:                    to,
+		AmountAntd:            round(payment.Amount),
+		AmountWei:             "0x" + amountWei.Text(16),
+		PayoutTxType:          txType,
+		PrivacyCommitmentTime: p.cfg.PrivacyCommitmentTime,
+		QuantumResistantTime:  p.cfg.QuantumResistantTime,
+		CreatedAt:             payment.CreatedAt,
+	})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("content-type", "application/json")
+	if token := strings.TrimSpace(p.cfg.ShieldedPayoutProverToken); token != "" {
+		req.Header.Set("authorization", "Bearer "+token)
+	}
+
+	resp, err := p.rpc.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", fmt.Errorf("prover returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var out ShieldedPayoutResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	if out.Error != "" {
+		return "", errors.New(out.Error)
+	}
+	txHash := out.TxHash
+	if txHash == "" {
+		txHash = out.Hash
+	}
+	txHash = strings.ToLower(normalizeHex(txHash))
+	if !isValidHash(txHash) {
+		return "", fmt.Errorf("prover returned invalid tx hash %q status=%q", out.TxHash, out.Status)
+	}
+	return txHash, nil
+}
+
 func (p *Pool) payDue(ctx context.Context) {
 	p.payDueWithConfirmations(ctx, p.cfg.PaymentConfirmations)
 }
@@ -1122,6 +1344,10 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 	network := p.networkStatus(ctx)
 	if !network.PayoutReady {
 		p.recordPaymentStatuses(due, "waiting: "+network.PayoutBlockedReason)
+		return
+	}
+	if network.PrivacyCommitmentActive && network.ShieldedPayoutsEnabled {
+		p.payDueShielded(ctx, due, network.PayoutTxType)
 		return
 	}
 
@@ -1211,12 +1437,63 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 	}
 }
 
+func (p *Pool) payDueShielded(ctx context.Context, due []Payment, txType string) {
+	for _, payment := range due {
+		originalAmount := payment.Amount
+		health, err := p.shieldedPayoutProverHealth(ctx)
+		if err != nil {
+			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover health check failed: "+err.Error())
+			continue
+		}
+		switch {
+		case !health.OK:
+			p.recordPaymentStatuses([]Payment{payment}, "waiting: "+firstNonEmpty(health.StartupError, "shielded payout prover is not ready"))
+			continue
+		case health.NoteInventoryError != "":
+			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout note inventory error: "+health.NoteInventoryError)
+			continue
+		case !health.HasSpendableNotes || health.AvailableNoteCount == 0:
+			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover has no spendable shielded notes")
+			continue
+		}
+		payment.Amount = effectiveShieldedPayoutAmountForNote(payment.Amount, health.AvailableNoteMaxWei)
+		if payment.Amount <= 0 {
+			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover has no spendable shielded note for this amount")
+			continue
+		}
+		if payment.Amount < p.cfg.MinPayoutAntd {
+			p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: shielded payout prover max note is below minimum payout %.8f TKM", p.cfg.MinPayoutAntd))
+			continue
+		}
+		if payment.Amount != round(originalAmount) {
+			log.Printf("shielded payout chunked wallet=%s requested=%.8f chunk=%.8f circuitMax=%.8f maxNoteWei=%s", payment.Wallet, originalAmount, payment.Amount, shieldedMaxPayoutPerTxAntd, health.AvailableNoteMaxWei)
+		}
+		tx, err := p.sendShieldedPayment(ctx, payment, txType)
+		p.mu.Lock()
+		if err != nil {
+			payment.Status = "waiting: shielded prover: " + err.Error()
+		} else {
+			payment.Status = "sent"
+			payment.TxHash = tx
+			p.balances[payment.Wallet] = round(p.balances[payment.Wallet] - payment.Amount)
+			if p.balances[payment.Wallet] <= 0 {
+				delete(p.balances, payment.Wallet)
+			}
+			log.Printf("shielded payout sent wallet=%s amount=%.8f tx=%s", payment.Wallet, payment.Amount, tx)
+		}
+		p.payments = append(p.payments, payment)
+		p.savePayoutStateLocked()
+		p.mu.Unlock()
+	}
+}
+
 func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 	status := NetworkStatus{
-		PrivacyCommitmentTime:   p.cfg.PrivacyCommitmentTime,
-		PrivacyCommitmentSource: "configured",
-		QuantumResistantTime:    p.cfg.QuantumResistantTime,
-		PayoutReady:             true,
+		PrivacyCommitmentTime:          p.cfg.PrivacyCommitmentTime,
+		PrivacyCommitmentSource:        "configured",
+		QuantumResistantTime:           p.cfg.QuantumResistantTime,
+		ShieldedPayoutProverConfigured: p.shieldedPayoutProverConfigured(),
+		PayoutReady:                    true,
 	}
 
 	if header, err := p.rpc.LatestHeader(ctx); err != nil {
@@ -1261,12 +1538,39 @@ func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 	if status.QuantumResistantActive {
 		status.PayoutTxType = pqTxTypeHex
 	}
+	status.ShieldedPayoutsEnabled = status.PrivacyCommitmentActive && status.ShieldedPayoutProverConfigured
 
 	var blockers []string
-	if status.PrivacyCommitmentActive {
+	if status.ShieldedPayoutsEnabled {
+		health, err := p.shieldedPayoutProverHealth(ctx)
+		if err != nil {
+			status.ShieldedPayoutProverError = err.Error()
+			blockers = append(blockers, "shielded payout prover health check failed: "+err.Error())
+		} else {
+			status.ShieldedPayoutAvailableNotes = health.AvailableNoteCount
+			status.ShieldedPayoutMaxNoteWei = health.AvailableNoteMaxWei
+			status.ShieldedPayoutProverError = firstNonEmpty(health.NoteInventoryError, health.StartupError)
+			maxNoteWei, _ := parseBigFlexible(health.AvailableNoteMaxWei)
+			minPayoutWei := antdToWeiInt(p.cfg.MinPayoutAntd)
+			switch {
+			case !health.OK:
+				reason := firstNonEmpty(health.StartupError, "shielded payout prover is not ready")
+				blockers = append(blockers, reason)
+			case health.NoteInventoryError != "":
+				blockers = append(blockers, "shielded payout note inventory error: "+health.NoteInventoryError)
+			case !health.HasSpendableNotes || health.AvailableNoteCount == 0:
+				blockers = append(blockers, "shielded payout prover has no spendable shielded notes")
+			case maxNoteWei == nil || maxNoteWei.Cmp(minPayoutWei) < 0:
+				blockers = append(blockers, fmt.Sprintf("shielded payout prover max note is below minimum payout %.8f TKM", p.cfg.MinPayoutAntd))
+			default:
+				status.ShieldedPayoutProverReady = true
+			}
+		}
+	}
+	if status.PrivacyCommitmentActive && !status.ShieldedPayoutsEnabled {
 		blockers = append(blockers, privacyTransparentPayoutBlockReason)
 	}
-	if status.QuantumResistantActive {
+	if status.QuantumResistantActive && !status.ShieldedPayoutsEnabled {
 		switch {
 		case status.PoolWalletAlgorithm == pqAlgorithmMLDSA87:
 		case status.PoolWalletAlgorithm != "":
@@ -1498,6 +1802,10 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 	network := p.networkStatus(r.Context())
 
 	poolWalletBalance := map[string]any{}
+	if network.PrivacyCommitmentActive && network.ShieldedPayoutsEnabled {
+		poolWalletBalance["shieldedPayoutMode"] = true
+		poolWalletBalance["payoutStatus"] = "shielded prover ready"
+	}
 	if latestWei, latestBlock, err := p.rpc.ConfirmedBalance(r.Context(), p.cfg.PoolWallet, 0); err != nil {
 		poolWalletBalance["latestError"] = err.Error()
 	} else {
@@ -1530,36 +1838,51 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 		poolWalletBalance["payoutStatus"] = "ready"
 		poolWalletBalance["totalOwedAntd"] = sumFloatMap(balances)
 
-		for wallet, balance := range balances {
-			if balance < p.cfg.MinPayoutAntd {
-				continue
+		if network.PrivacyCommitmentActive && network.ShieldedPayoutsEnabled {
+			poolWalletBalance["shieldedPayoutMode"] = true
+			poolWalletBalance["payoutStatus"] = "shielded prover ready"
+			poolWalletBalance["shieldedMaxPayoutPerTxAntd"] = shieldedMaxPayoutPerTxAntd
+			for wallet, balance := range balances {
+				if balance < p.cfg.MinPayoutAntd {
+					continue
+				}
+				nextAmount := effectiveShieldedPayoutAmount(minFloat(balance, p.cfg.MaxPayoutPerTxAntd))
+				poolWalletBalance["nextPayoutWallet"] = wallet
+				poolWalletBalance["nextPayoutAntd"] = nextAmount
+				break
 			}
-			nextAmount := round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd))
-			poolWalletBalance["nextPayoutWallet"] = wallet
-			poolWalletBalance["nextPayoutAntd"] = nextAmount
-			feeWei, err := p.rpc.PaymentFee(r.Context(), p.cfg.PoolWallet, wallet, nextAmount, network.PayoutTxType)
-			if err != nil {
-				if isInsufficientFundsError(err) {
+		} else {
+			for wallet, balance := range balances {
+				if balance < p.cfg.MinPayoutAntd {
+					continue
+				}
+				nextAmount := round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd))
+				poolWalletBalance["nextPayoutWallet"] = wallet
+				poolWalletBalance["nextPayoutAntd"] = nextAmount
+				feeWei, err := p.rpc.PaymentFee(r.Context(), p.cfg.PoolWallet, wallet, nextAmount, network.PayoutTxType)
+				if err != nil {
+					if isInsufficientFundsError(err) {
+						poolWalletBalance["lowBalance"] = true
+						poolWalletBalance["payoutStatus"] = "low pool wallet balance"
+					} else {
+						poolWalletBalance["feeEstimateError"] = err.Error()
+					}
+					break
+				}
+				spendableAfterFee := new(big.Int).Sub(spendableWei, feeWei)
+				if spendableAfterFee.Sign() < 0 {
+					spendableAfterFee = new(big.Int)
+				}
+				poolWalletBalance["estimatedTxFeeAntd"] = weiToAntd(feeWei)
+				poolWalletBalance["spendableAfterFeeAntd"] = weiToAntd(spendableAfterFee)
+				if new(big.Int).Add(antdToWeiInt(nextAmount), feeWei).Cmp(spendableWei) > 0 {
 					poolWalletBalance["lowBalance"] = true
 					poolWalletBalance["payoutStatus"] = "low pool wallet balance"
 				} else {
-					poolWalletBalance["feeEstimateError"] = err.Error()
+					poolWalletBalance["payoutStatus"] = "next payout can be sent"
 				}
 				break
 			}
-			spendableAfterFee := new(big.Int).Sub(spendableWei, feeWei)
-			if spendableAfterFee.Sign() < 0 {
-				spendableAfterFee = new(big.Int)
-			}
-			poolWalletBalance["estimatedTxFeeAntd"] = weiToAntd(feeWei)
-			poolWalletBalance["spendableAfterFeeAntd"] = weiToAntd(spendableAfterFee)
-			if new(big.Int).Add(antdToWeiInt(nextAmount), feeWei).Cmp(spendableWei) > 0 {
-				poolWalletBalance["lowBalance"] = true
-				poolWalletBalance["payoutStatus"] = "low pool wallet balance"
-			} else {
-				poolWalletBalance["payoutStatus"] = "next payout can be sent"
-			}
-			break
 		}
 	}
 	if !network.PayoutReady {
@@ -1588,6 +1911,7 @@ func (p *Pool) writeAdminStatus(w http.ResponseWriter, r *http.Request) {
 		"autoPay":                        p.cfg.AutoPay,
 		"minPayoutAntd":                  p.cfg.MinPayoutAntd,
 		"maxPayoutPerTxAntd":             p.cfg.MaxPayoutPerTxAntd,
+		"effectiveMaxPayoutPerTxAntd":    effectiveMaxPayoutPerTxAntd(p.cfg.MaxPayoutPerTxAntd, network.PrivacyCommitmentActive && network.ShieldedPayoutsEnabled),
 		"paymentIntervalSeconds":         p.cfg.PaymentIntervalSeconds,
 		"paymentConfirmations":           p.cfg.PaymentConfirmations,
 		"payoutReserveAntd":              p.cfg.PayoutReserveAntd,
@@ -1944,6 +2268,25 @@ func weiToAntd(wei *big.Int) float64 {
 	}
 	antd, _ := new(big.Float).Quo(new(big.Float).SetInt(wei), big.NewFloat(1e18)).Float64()
 	return round(antd)
+}
+
+func weiToAntdFloor(wei *big.Int) float64 {
+	if wei == nil || wei.Sign() <= 0 {
+		return 0
+	}
+	scaled := new(big.Int).Mul(new(big.Int).Set(wei), big.NewInt(100000000))
+	scaled.Div(scaled, big.NewInt(1000000000000000000))
+	antd, _ := new(big.Float).Quo(new(big.Float).SetInt(scaled), big.NewFloat(100000000)).Float64()
+	return round(antd)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func antdToWeiHex(amount float64) string {
@@ -2425,10 +2768,10 @@ const adminHTML = `<!doctype html>
       $('redisBytes').textContent = s.redis && s.redis.ok ? String(s.redis.stateBytes || 0) + ' bytes saved' : ((s.redis && s.redis.error) || '');
       $('forkMode').innerHTML = networkHTML(n);
       $('payoutTxType').textContent = 'payout tx type ' + (n.payoutTxType || 'default');
-      const payoutStatus = b.confirmedError ? errText(b.confirmedError) : (b.lowBalance ? '<span class="warn">' + (b.payoutStatus || 'low pool wallet balance') + '</span>' : '<span class="ok">' + (b.payoutStatus || 'ready') + '</span>');
-      $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Payout status', payoutStatus) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Pending balance', b.pendingError ? errText(b.pendingError) : (b.pendingAntd !== undefined ? money(b.pendingAntd) : '-')) + kv('Usable balance', b.availableAntd !== undefined ? money(b.availableAntd) : '-') + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Total miner balance owed', b.totalOwedAntd !== undefined ? money(b.totalOwedAntd) : money(s.totalConfirmedMinerBalanceAntd)) + kv('Estimated next tx fee', b.estimatedTxFeeAntd !== undefined ? money(b.estimatedTxFeeAntd) : (b.feeEstimateError ? errText(b.feeEstimateError) : '-')) + kv('Spendable after next fee', b.spendableAfterFeeAntd !== undefined ? money(b.spendableAfterFeeAntd) : '-') + kv('Next payout', b.nextPayoutAntd !== undefined ? money(b.nextPayoutAntd) + ' to ' + b.nextPayoutWallet : '-') + kv('Payout tx type', n.payoutTxType || 'default') + kv('Pool wallet algorithm', n.poolWalletAlgorithm || (n.poolWalletAlgorithmError ? errText(n.poolWalletAlgorithmError) : '-')) + kv('Quantum active', yesno(n.quantumResistantActive)) + kv('Privacy commitments active', yesno(n.privacyCommitmentActive)) + kv('Payout gate', n.payoutReady ? '<span class="ok">ready</span>' : '<span class="warn">' + (n.payoutBlockedReason || 'blocked') + '</span>') + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
+      const payoutStatus = b.shieldedPayoutMode ? '<span class="ok">' + (b.payoutStatus || 'shielded prover ready') + '</span>' : (b.confirmedError ? errText(b.confirmedError) : (b.lowBalance ? '<span class="warn">' + (b.payoutStatus || 'low pool wallet balance') + '</span>' : '<span class="ok">' + (b.payoutStatus || 'ready') + '</span>'));
+      $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Payout status', payoutStatus) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Pending balance', b.pendingError ? errText(b.pendingError) : (b.pendingAntd !== undefined ? money(b.pendingAntd) : '-')) + kv('Usable balance', b.availableAntd !== undefined ? money(b.availableAntd) : '-') + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Total miner balance owed', b.totalOwedAntd !== undefined ? money(b.totalOwedAntd) : money(s.totalConfirmedMinerBalanceAntd)) + kv('Estimated next tx fee', b.estimatedTxFeeAntd !== undefined ? money(b.estimatedTxFeeAntd) : (b.feeEstimateError ? errText(b.feeEstimateError) : '-')) + kv('Spendable after next fee', b.spendableAfterFeeAntd !== undefined ? money(b.spendableAfterFeeAntd) : '-') + kv('Next payout', b.nextPayoutAntd !== undefined ? money(b.nextPayoutAntd) + ' to ' + b.nextPayoutWallet : '-') + kv('Payout tx type', n.payoutTxType || 'default') + kv('Pool wallet algorithm', n.poolWalletAlgorithm || (n.poolWalletAlgorithmError ? errText(n.poolWalletAlgorithmError) : '-')) + kv('Quantum active', yesno(n.quantumResistantActive)) + kv('Privacy commitments active', yesno(n.privacyCommitmentActive)) + kv('Shielded prover configured', yesno(n.shieldedPayoutProverConfigured)) + kv('Shielded payouts enabled', yesno(n.shieldedPayoutsEnabled)) + kv('Payout gate', n.payoutReady ? '<span class="ok">ready</span>' : '<span class="warn">' + (n.payoutBlockedReason || 'blocked') + '</span>') + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
       $('runtimeRows').innerHTML = kv('Public URL', s.publicURL) + kv('HTTP bind', s.http) + kv('Stratum public', s.stratum) + kv('Stratum bind', s.stratumBind) + kv('Explorer', s.explorerURL || '-') + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Connected miners', s.authorizedSessions ?? s.connectedSessions ?? 0) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
-      $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Privacy commitment time', n.privacyCommitmentTime ? new Date(Number(n.privacyCommitmentTime) * 1000).toISOString() : '-') + kv('Quantum-resistant time', n.quantumResistantTime ? new Date(Number(n.quantumResistantTime) * 1000).toISOString() : '-') + kv('Recent payment records', s.paymentCount);
+      $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Configured maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Effective maximum per tx', money(s.effectiveMaxPayoutPerTxAntd || s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Shielded payout prover', yesno(n.shieldedPayoutProverConfigured)) + kv('Shielded payout mode', yesno(n.shieldedPayoutsEnabled)) + kv('Privacy commitment time', n.privacyCommitmentTime ? new Date(Number(n.privacyCommitmentTime) * 1000).toISOString() : '-') + kv('Quantum-resistant time', n.quantumResistantTime ? new Date(Number(n.quantumResistantTime) * 1000).toISOString() : '-') + kv('Recent payment records', s.paymentCount);
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       $('balances').innerHTML = wallets.map(w => {
         const confirmed = (s.balances || {})[w] || 0;
