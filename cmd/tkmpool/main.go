@@ -1830,7 +1830,11 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 }
 
 func (p *Pool) writeUserStatus(w http.ResponseWriter, r *http.Request) {
-	wallet := normalizeAddress(r.URL.Query().Get("address"))
+	walletInput := strings.TrimSpace(r.URL.Query().Get("address"))
+	wallet := normalizeAddress(walletInput)
+	if recipient, err := parseShieldedPaymentCode(walletInput); err == nil {
+		wallet = recipient.Address
+	}
 	if !isValidAddress(wallet) {
 		http.Error(w, "invalid wallet address", http.StatusBadRequest)
 		return
@@ -2491,13 +2495,26 @@ const indexHTML = `<!doctype html>
     .pager { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; flex-wrap:wrap; }
     @media (max-width: 860px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } main { padding:16px; } }
     @media (max-width: 560px) { .grid { grid-template-columns:1fr; } header { padding:18px; } .value { font-size:20px; } }
+    /* Pool console visual system */
+    :root { color-scheme:dark; --bg:#07111f; --ink:#e6edf7; --muted:#93a4ba; --line:rgba(148,163,184,.18); --panel:rgba(14,27,47,.88); --green:#34d399; --red:#fb7185; --orange:#fbbf24; --blue:#65a8ff; }
+    body { min-height:100vh; background:radial-gradient(900px 540px at 8% -12%,rgba(29,116,255,.25),transparent 65%),radial-gradient(900px 500px at 100% 0,rgba(16,185,129,.12),transparent 62%),var(--bg); letter-spacing:.01em; }
+    header { position:relative; overflow:hidden; background:linear-gradient(115deg,#09162b,#112a4a 52%,#0c2039); border-bottom:1px solid rgba(148,163,184,.18); padding:28px clamp(20px,5vw,56px); }
+    header:after { content:""; position:absolute; width:340px; height:340px; right:-120px; top:-220px; border:1px solid rgba(101,168,255,.25); border-radius:50%; box-shadow:0 0 0 42px rgba(101,168,255,.04),0 0 0 84px rgba(101,168,255,.03); }
+    header > * { position:relative; z-index:1; } h1 { font-size:clamp(24px,3vw,34px); font-weight:780; letter-spacing:-.04em; } main { max-width:1320px; padding:32px 24px 56px; }
+    .grid { gap:16px; grid-template-columns:repeat(5,minmax(0,1fr)); } .panel { background:linear-gradient(145deg,rgba(20,38,65,.96),rgba(10,23,42,.92)); border-color:var(--line); border-radius:14px; box-shadow:0 14px 38px rgba(0,0,0,.18); }
+    .metric { min-height:120px; position:relative; overflow:hidden; } .metric:before { content:""; position:absolute; inset:0 auto 0 0; width:3px; background:linear-gradient(#65a8ff,#34d399); } .label { color:#8fa8c8; letter-spacing:.09em; } .value { font-size:clamp(21px,2.2vw,30px); color:#f5f9ff; letter-spacing:-.035em; }
+    .section { margin-top:22px; } .section h2 { font-size:18px; letter-spacing:-.02em; } .muted { color:var(--muted); } code { background:rgba(101,168,255,.1); border-color:rgba(101,168,255,.22); color:#bcd7ff; }
+    button,a.button { border:1px solid rgba(149,193,255,.45); background:linear-gradient(135deg,#3478dc,#2260bd); border-radius:9px; box-shadow:0 6px 18px rgba(32,96,189,.23); transition:transform .16s ease,filter .16s ease; } button:hover,a.button:hover { transform:translateY(-1px); filter:brightness(1.12); } button:focus-visible,a.button:focus-visible { outline:3px solid rgba(101,168,255,.45); outline-offset:2px; }
+    .ok,.bad,.warn { display:inline-flex; align-items:center; gap:5px; padding:3px 8px; border-radius:999px; font-size:12px; } .ok { color:#6ee7b7; background:rgba(52,211,153,.12); } .bad { color:#fda4af; background:rgba(251,113,133,.12); } .warn { color:#fde68a; background:rgba(251,191,36,.12); }
+    th { color:#89a3c4; background:rgba(5,15,30,.23); } th,td { border-color:var(--line); padding:12px 10px; } tr:last-child td { border-bottom:0; } table { font-size:13px; } td:first-child { color:#d7e4f7; } a { color:#8bbdff; } .pager { border-top:1px solid var(--line); padding-top:14px; }
+    @media(max-width:1050px) { .grid { grid-template-columns:repeat(3,minmax(0,1fr)); } } @media(max-width:700px) { main { padding:20px 14px 40px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .panel { border-radius:12px; padding:14px; } table { display:block; overflow-x:auto; white-space:nowrap; } } @media(max-width:460px) { .grid { grid-template-columns:1fr; } header .row { width:100%; } header .button,header button { flex:1; text-align:center; } }
   </style>
 </head>
 <body>
   <header>
     <div>
       <h1>{{POOL_NAME}}</h1>
-      <div class="muted">RandomX Tkmchain mining pool</div>
+      <div class="muted">RandomX mining · Shield2-ready payouts</div>
     </div>
     <div class="row">
       <span>Stratum <code id="stratum">loading</code></span>
@@ -2520,7 +2537,7 @@ const indexHTML = `<!doctype html>
       <table>
         <tbody>
           <tr><th>Miner URL</th><td><code id="minerUrl"></code></td></tr>
-          <tr><th>Username</th><td>Your TKM payout wallet, optionally <code>0xWallet.worker</code></td></tr>
+          <tr><th>Username</th><td>Your <code>tkmshield2</code> payment code, optionally <code>.worker</code></td></tr>
           <tr><th>Password</th><td><code>x</code></td></tr>
           <tr><th>Pool Wallet</th><td id="poolWallet"></td></tr>
         </tbody>
@@ -2654,6 +2671,10 @@ const userHTML = `<!doctype html>
     .warn { color:var(--orange); font-weight:750; }
     @media (max-width: 820px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } main { padding:16px; } }
     @media (max-width: 540px) { .grid { grid-template-columns:1fr; } }
+    :root { color-scheme:dark; --bg:#07111f; --ink:#e6edf7; --muted:#93a4ba; --line:rgba(148,163,184,.18); --panel:rgba(14,27,47,.88); --green:#34d399; --red:#fb7185; --orange:#fbbf24; --blue:#65a8ff; }
+    body { min-height:100vh; background:radial-gradient(800px 500px at 7% -10%,rgba(29,116,255,.25),transparent 65%),var(--bg); } header { background:linear-gradient(115deg,#09162b,#112a4a); border-bottom:1px solid var(--line); padding:28px clamp(20px,5vw,56px); } h1 { font-size:clamp(24px,3vw,34px); letter-spacing:-.04em; } main { max-width:1220px; padding:32px 24px 56px; }
+    .panel { background:linear-gradient(145deg,rgba(20,38,65,.96),rgba(10,23,42,.92)); border-color:var(--line); border-radius:14px; box-shadow:0 14px 38px rgba(0,0,0,.18); } .grid { gap:16px; grid-template-columns:repeat(5,minmax(0,1fr)); } .metric { position:relative; overflow:hidden; } .metric:before { content:""; position:absolute; inset:0 auto 0 0; width:3px; background:linear-gradient(#65a8ff,#34d399); } .label { color:#8fa8c8; letter-spacing:.09em; } .value { color:#f5f9ff; letter-spacing:-.035em; }
+    input { background:rgba(5,15,30,.48); border-color:rgba(101,168,255,.3); color:var(--ink); border-radius:9px; padding:12px 14px; } input:focus { outline:3px solid rgba(101,168,255,.25); border-color:#65a8ff; } button,a.button { border-color:rgba(149,193,255,.45); background:linear-gradient(135deg,#3478dc,#2260bd); border-radius:9px; box-shadow:0 6px 18px rgba(32,96,189,.23); } .ok,.bad,.warn { display:inline-flex; padding:3px 8px; border-radius:999px; font-size:12px; } .ok { color:#6ee7b7; background:rgba(52,211,153,.12); } .bad { color:#fda4af; background:rgba(251,113,133,.12); } .warn { color:#fde68a; background:rgba(251,191,36,.12); } th,td { border-color:var(--line); padding:12px 10px; } th { color:#89a3c4; background:rgba(5,15,30,.23); } a { color:#8bbdff; } @media(max-width:980px) { .grid { grid-template-columns:repeat(3,minmax(0,1fr)); } } @media(max-width:700px) { main { padding:20px 14px 40px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } table { display:block; overflow-x:auto; white-space:nowrap; } } @media(max-width:460px) { .grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -2664,7 +2685,7 @@ const userHTML = `<!doctype html>
   <main>
     <section class="panel">
       <div class="row">
-        <input id="address" placeholder="Enter your payout wallet address">
+        <input id="address" placeholder="Enter your Shield2 code or 0x payout address">
         <button id="lookup">Lookup</button>
       </div>
       <div id="error" class="bad" style="margin-top:10px"></div>
@@ -2783,6 +2804,10 @@ const adminHTML = `<!doctype html>
     .split { display:grid; gap:14px; grid-template-columns:1fr 1fr; }
     @media (max-width: 920px) { .grid { grid-template-columns:repeat(2, minmax(0, 1fr)); } .split { grid-template-columns:1fr; } main { padding:16px; } }
     @media (max-width: 560px) { .grid { grid-template-columns:1fr; } header { padding:18px; } .value { font-size:20px; } }
+    :root { color-scheme:dark; --bg:#07111f; --ink:#e6edf7; --muted:#93a4ba; --line:rgba(148,163,184,.18); --panel:rgba(14,27,47,.88); --green:#34d399; --red:#fb7185; --orange:#fbbf24; --blue:#65a8ff; }
+    body { min-height:100vh; background:radial-gradient(900px 540px at 8% -12%,rgba(29,116,255,.24),transparent 65%),radial-gradient(800px 460px at 100% 0,rgba(16,185,129,.1),transparent 62%),var(--bg); } header { background:linear-gradient(115deg,#09162b,#112a4a 52%,#0c2039); border-bottom:1px solid var(--line); padding:28px clamp(20px,5vw,56px); } h1 { font-size:clamp(24px,3vw,34px); letter-spacing:-.04em; } main { max-width:1380px; padding:32px 24px 56px; }
+    .grid { gap:16px; grid-template-columns:repeat(5,minmax(0,1fr)); } .panel { background:linear-gradient(145deg,rgba(20,38,65,.96),rgba(10,23,42,.92)); border-color:var(--line); border-radius:14px; box-shadow:0 14px 38px rgba(0,0,0,.18); } .metric { position:relative; overflow:hidden; } .metric:before { content:""; position:absolute; inset:0 auto 0 0; width:3px; background:linear-gradient(#65a8ff,#34d399); } .label { color:#8fa8c8; letter-spacing:.09em; } .value { color:#f5f9ff; letter-spacing:-.035em; } .split { gap:16px; }
+    button,a.button { border-color:rgba(149,193,255,.45); background:linear-gradient(135deg,#3478dc,#2260bd); border-radius:9px; box-shadow:0 6px 18px rgba(32,96,189,.23); transition:transform .16s ease,filter .16s ease; } button:hover,a.button:hover { transform:translateY(-1px); filter:brightness(1.12); } .ok,.bad,.warn { display:inline-flex; padding:3px 8px; border-radius:999px; font-size:12px; } .ok { color:#6ee7b7; background:rgba(52,211,153,.12); } .bad { color:#fda4af; background:rgba(251,113,133,.12); } .warn { color:#fde68a; background:rgba(251,191,36,.12); } code { background:rgba(101,168,255,.1); border-color:rgba(101,168,255,.22); color:#bcd7ff; } th,td { border-color:var(--line); padding:12px 10px; } th { color:#89a3c4; background:rgba(5,15,30,.23); } a { color:#8bbdff; } @media(max-width:1050px) { .grid { grid-template-columns:repeat(3,minmax(0,1fr)); } } @media(max-width:700px) { main { padding:20px 14px 40px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } table { display:block; overflow-x:auto; white-space:nowrap; } } @media(max-width:460px) { .grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
