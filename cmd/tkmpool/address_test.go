@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,6 +53,16 @@ func TestParseAuthorizeRejectsBadAddress(t *testing.T) {
 	}
 	if worker != "rig1" {
 		t.Fatalf("parseAuthorize worker = %q, want rig1", worker)
+	}
+}
+
+func TestParseMinerLoginAcceptsShield2RecipientAndWorker(t *testing.T) {
+	address := "0xf03a2a24c8926dba5a44301c751aec047b60b0a6"
+	viewKey := "ab" + strings.Repeat("cd", 31)
+	code := testShieldedCode(address, viewKey)
+	wallet, worker, gotViewKey := parseMinerLoginRecipient(code + ".rig1")
+	if wallet != address || worker != "rig1" || gotViewKey != viewKey {
+		t.Fatalf("Shield2 login = wallet %q worker %q key %q", wallet, worker, gotViewKey)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -59,13 +60,15 @@ type Config struct {
 	QuantumResistantTime      uint64  `json:"quantumResistantTime"`
 	ShieldedPayoutProverURL   string  `json:"shieldedPayoutProverURL"`
 	ShieldedPayoutProverToken string  `json:"shieldedPayoutProverToken"`
+	ShieldedPayoutChangeCode  string  `json:"shieldedPayoutChangeCode"`
 }
 
 type PayoutState struct {
-	Balances    map[string]float64 `json:"balances"`
-	Payments    []Payment          `json:"payments"`
-	Miners      map[string]Miner   `json:"miners"`
-	TotalShares uint64             `json:"totalShares"`
+	Balances          map[string]float64 `json:"balances"`
+	Payments          []Payment          `json:"payments"`
+	Miners            map[string]Miner   `json:"miners"`
+	RecipientViewKeys map[string]string  `json:"recipientViewKeys,omitempty"`
+	TotalShares       uint64             `json:"totalShares"`
 }
 
 type Work struct {
@@ -85,11 +88,12 @@ type Miner struct {
 }
 
 type Payment struct {
-	Wallet    string    `json:"wallet"`
-	Amount    float64   `json:"amountAntd"`
-	Status    string    `json:"status"`
-	TxHash    string    `json:"txHash,omitempty"`
-	CreatedAt time.Time `json:"createdAt"`
+	Wallet           string    `json:"wallet"`
+	Amount           float64   `json:"amountAntd"`
+	Status           string    `json:"status"`
+	TxHash           string    `json:"txHash,omitempty"`
+	CreatedAt        time.Time `json:"createdAt"`
+	RecipientViewKey string    `json:"recipientViewKey,omitempty"`
 }
 
 type RPCHeader struct {
@@ -129,20 +133,21 @@ const (
 )
 
 type Pool struct {
-	cfg      Config
-	rpc      *RPCClient
-	mu       sync.RWMutex
-	work     Work
-	miners   map[string]*Miner
-	balances map[string]float64
-	payments []Payment
-	jobs     map[string]Work
-	sessions map[*stratumSession]struct{}
-	logMu    sync.Mutex
-	lastLog  map[string]logThrottle
-	started  time.Time
-	shares   atomic.Uint64
-	paying   atomic.Bool
+	cfg               Config
+	rpc               *RPCClient
+	mu                sync.RWMutex
+	work              Work
+	miners            map[string]*Miner
+	balances          map[string]float64
+	payments          []Payment
+	jobs              map[string]Work
+	sessions          map[*stratumSession]struct{}
+	recipientViewKeys map[string]string
+	logMu             sync.Mutex
+	lastLog           map[string]logThrottle
+	started           time.Time
+	shares            atomic.Uint64
+	paying            atomic.Bool
 }
 
 type logThrottle struct {
@@ -251,6 +256,7 @@ func loadConfig(path string) (Config, error) {
 	cfg.ExplorerURL = strings.TrimRight(cfg.ExplorerURL, "/")
 	cfg.ShieldedPayoutProverURL = strings.TrimSpace(cfg.ShieldedPayoutProverURL)
 	cfg.ShieldedPayoutProverToken = strings.TrimSpace(cfg.ShieldedPayoutProverToken)
+	cfg.ShieldedPayoutChangeCode = strings.TrimSpace(cfg.ShieldedPayoutChangeCode)
 	if cfg.PublicStratum == "" {
 		cfg.PublicStratum = cfg.ListenStratum
 	}
@@ -300,14 +306,15 @@ func loadConfig(path string) (Config, error) {
 
 func NewPool(cfg Config) *Pool {
 	pool := &Pool{
-		cfg:      cfg,
-		rpc:      &RPCClient{endpoint: cfg.NodeRPC, method: strings.ToLower(cfg.WorkMethod), client: &http.Client{Timeout: time.Duration(cfg.RPCTimeoutSeconds) * time.Second}},
-		miners:   make(map[string]*Miner),
-		balances: make(map[string]float64),
-		jobs:     make(map[string]Work),
-		sessions: make(map[*stratumSession]struct{}),
-		lastLog:  make(map[string]logThrottle),
-		started:  time.Now(),
+		cfg:               cfg,
+		rpc:               &RPCClient{endpoint: cfg.NodeRPC, method: strings.ToLower(cfg.WorkMethod), client: &http.Client{Timeout: time.Duration(cfg.RPCTimeoutSeconds) * time.Second}},
+		miners:            make(map[string]*Miner),
+		balances:          make(map[string]float64),
+		recipientViewKeys: make(map[string]string),
+		jobs:              make(map[string]Work),
+		sessions:          make(map[*stratumSession]struct{}),
+		lastLog:           make(map[string]logThrottle),
+		started:           time.Now(),
 	}
 	pool.loadPayoutState()
 	return pool
@@ -382,6 +389,15 @@ func (p *Pool) applyPayoutStateLocked(state PayoutState) {
 			p.mergeMinerLocked(miner)
 		}
 	}
+	if state.RecipientViewKeys != nil {
+		p.recipientViewKeys = make(map[string]string, len(state.RecipientViewKeys))
+		for wallet, key := range state.RecipientViewKeys {
+			wallet = normalizeAddress(wallet)
+			if isValidAddress(wallet) && isValidViewKey(key) {
+				p.recipientViewKeys[wallet] = strings.ToLower(strings.TrimPrefix(key, "0x"))
+			}
+		}
+	}
 	if state.TotalShares > 0 {
 		p.shares.Store(state.TotalShares)
 	}
@@ -421,10 +437,11 @@ func (p *Pool) readRedisPayoutState() (PayoutState, bool, error) {
 
 func (p *Pool) savePayoutStateLocked() {
 	state := PayoutState{
-		Balances:    make(map[string]float64, len(p.balances)),
-		Payments:    append([]Payment{}, p.payments...),
-		Miners:      make(map[string]Miner, len(p.miners)),
-		TotalShares: p.shares.Load(),
+		Balances:          make(map[string]float64, len(p.balances)),
+		Payments:          append([]Payment{}, p.payments...),
+		Miners:            make(map[string]Miner, len(p.miners)),
+		RecipientViewKeys: make(map[string]string, len(p.recipientViewKeys)),
+		TotalShares:       p.shares.Load(),
 	}
 	for wallet, balance := range p.balances {
 		state.Balances[wallet] = round(balance)
@@ -433,6 +450,9 @@ func (p *Pool) savePayoutStateLocked() {
 		if miner != nil {
 			state.Miners[key] = *miner
 		}
+	}
+	for wallet, key := range p.recipientViewKeys {
+		state.RecipientViewKeys[wallet] = key
 	}
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -601,6 +621,7 @@ func (p *Pool) handleStratum(conn net.Conn) {
 	sessionID := randomHex(8)
 	wallet := ""
 	worker := ""
+	viewKey := ""
 
 	for {
 		var req stratumRequest
@@ -613,7 +634,7 @@ func (p *Pool) handleStratum(conn net.Conn) {
 
 		switch req.Method {
 		case "login":
-			wallet, worker = parseXMRigLogin(req.Params)
+			wallet, worker, viewKey = parseXMRigLoginRecipient(req.Params)
 			if wallet != "" {
 				session.mu.Lock()
 				session.wallet = wallet
@@ -622,7 +643,7 @@ func (p *Pool) handleStratum(conn net.Conn) {
 				session.rpcID = sessionID
 				session.mu.Unlock()
 				log.Printf("xmrig miner connected miner=%s", minerLabel(wallet, worker))
-				p.touchMiner(wallet, worker)
+				p.touchMiner(wallet, worker, viewKey)
 			}
 			result := map[string]any{"id": sessionID, "extensions": []string{"algo"}}
 			if wallet != "" {
@@ -653,7 +674,7 @@ func (p *Pool) handleStratum(conn net.Conn) {
 			})
 			p.notifyCurrent(session)
 		case "mining.authorize":
-			wallet, worker = parseAuthorize(req.Params)
+			wallet, worker, viewKey = parseAuthorizeRecipient(req.Params)
 			if wallet != "" {
 				session.mu.Lock()
 				session.wallet = wallet
@@ -661,7 +682,7 @@ func (p *Pool) handleStratum(conn net.Conn) {
 				session.mu.Unlock()
 				log.Printf("miner connected miner=%s", minerLabel(wallet, worker))
 			}
-			p.touchMiner(wallet, worker)
+			p.touchMiner(wallet, worker, viewKey)
 			session.write(map[string]any{"id": req.ID, "result": wallet != "", "error": nil})
 		case "mining.submit":
 			if wallet == "" {
@@ -744,20 +765,30 @@ func jobID(work Work) string {
 }
 
 func parseAuthorize(raw json.RawMessage) (string, string) {
+	wallet, worker, _ := parseAuthorizeRecipient(raw)
+	return wallet, worker
+}
+
+func parseAuthorizeRecipient(raw json.RawMessage) (string, string, string) {
 	var params []string
 	_ = json.Unmarshal(raw, &params)
 	if len(params) == 0 {
-		return "", ""
+		return "", "", ""
 	}
-	return parseMinerLogin(params[0])
+	return parseMinerLoginRecipient(params[0])
 }
 
 func parseXMRigLogin(raw json.RawMessage) (string, string) {
+	wallet, worker, _ := parseXMRigLoginRecipient(raw)
+	return wallet, worker
+}
+
+func parseXMRigLoginRecipient(raw json.RawMessage) (string, string, string) {
 	var params struct {
 		Login string `json:"login"`
 	}
 	_ = json.Unmarshal(raw, &params)
-	return parseMinerLogin(params.Login)
+	return parseMinerLoginRecipient(params.Login)
 }
 
 func jsonRPCResponseID(id any) any {
@@ -775,20 +806,36 @@ func jsonRPCResponseID(id any) any {
 }
 
 func parseMinerLogin(user string) (string, string) {
-	wallet, worker, _ := strings.Cut(strings.TrimSpace(user), ".")
-	wallet = normalizeAddress(wallet)
-	if !isValidAddress(wallet) {
-		log.Printf("invalid miner payout wallet rejected wallet=%s", strings.TrimSpace(wallet))
-		return "", strings.TrimSpace(worker)
+	wallet, worker, _ := parseMinerLoginRecipient(user)
+	return wallet, worker
+}
+
+func parseMinerLoginRecipient(user string) (string, string, string) {
+	user = strings.TrimSpace(user)
+	if recipient, err := parseShieldedPaymentCode(user); err == nil {
+		return recipient.Address, "", recipient.ViewKey
 	}
-	return wallet, strings.TrimSpace(worker)
+	separator := strings.LastIndex(user, ".")
+	walletText, worker := user, ""
+	if separator > 0 {
+		walletText, worker = user[:separator], strings.TrimSpace(user[separator+1:])
+		if recipient, err := parseShieldedPaymentCode(walletText); err == nil {
+			return recipient.Address, worker, recipient.ViewKey
+		}
+	}
+	wallet := normalizeAddress(walletText)
+	if !isValidAddress(wallet) {
+		log.Printf("invalid miner payout wallet rejected wallet=%s", walletText)
+		return "", worker, ""
+	}
+	return wallet, worker, ""
 }
 
 func minerKey(wallet, worker string) string {
 	return wallet + "." + worker
 }
 
-func (p *Pool) touchMiner(wallet, worker string) {
+func (p *Pool) touchMiner(wallet, worker, viewKey string) {
 	if wallet == "" {
 		return
 	}
@@ -801,6 +848,9 @@ func (p *Pool) touchMiner(wallet, worker string) {
 		p.miners[key] = m
 	}
 	m.LastSeen = time.Now()
+	if isValidViewKey(viewKey) {
+		p.recipientViewKeys[wallet] = strings.ToLower(strings.TrimPrefix(viewKey, "0x"))
+	}
 	p.savePayoutStateLocked()
 }
 
@@ -1026,6 +1076,49 @@ func isValidAddress(s string) bool {
 	return len(s) == 42 && strings.HasPrefix(strings.ToLower(s), "0x") && isHexString(s[2:])
 }
 
+const shieldedPaymentChainID = uint64(8979)
+
+type shieldedPaymentCode struct {
+	Version uint8  `json:"v"`
+	ChainID uint64 `json:"c"`
+	Address string `json:"a"`
+	ViewKey string `json:"k"`
+}
+
+type shieldedRecipient struct {
+	Address string
+	ViewKey string
+}
+
+// parseShieldedPaymentCode accepts the public tkmshield2 code produced by
+// gtkm and the native wallet. Its view key is public recipient metadata, not
+// a spending key.
+func parseShieldedPaymentCode(code string) (shieldedRecipient, error) {
+	code = strings.TrimSpace(code)
+	const prefix = "tkmshield2."
+	if !strings.HasPrefix(strings.ToLower(code), prefix) {
+		return shieldedRecipient{}, errors.New("not a Shield2 payment code")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(code[len(prefix):])
+	if err != nil {
+		return shieldedRecipient{}, errors.New("invalid Shield2 payment code")
+	}
+	var decoded shieldedPaymentCode
+	if err := json.Unmarshal(payload, &decoded); err != nil || decoded.Version != 2 || decoded.ChainID != shieldedPaymentChainID {
+		return shieldedRecipient{}, errors.New("Shield2 payment code is not for TKM mainnet")
+	}
+	address := normalizeAddress(decoded.Address)
+	if !isValidAddress(address) || !isValidViewKey(decoded.ViewKey) {
+		return shieldedRecipient{}, errors.New("invalid Shield2 payment code recipient")
+	}
+	return shieldedRecipient{Address: address, ViewKey: strings.ToLower(strings.TrimPrefix(decoded.ViewKey, "0x"))}, nil
+}
+
+func isValidViewKey(key string) bool {
+	key = strings.TrimPrefix(strings.TrimSpace(key), "0x")
+	return len(key) == 64 && isHexString(key)
+}
+
 func isValidHash(s string) bool {
 	s = normalizeHex(s)
 	return len(s) == 66 && strings.HasPrefix(strings.ToLower(s), "0x") && isHexString(s[2:])
@@ -1120,6 +1213,8 @@ type ShieldedPayoutRequest struct {
 	AmountAntd            float64   `json:"amountAntd"`
 	AmountWei             string    `json:"amountWei"`
 	PayoutTxType          string    `json:"payoutTxType,omitempty"`
+	RecipientViewKey      string    `json:"recipientViewKey"`
+	ChangeViewKey         string    `json:"changeViewKey"`
 	PrivacyCommitmentTime uint64    `json:"privacyCommitmentTime"`
 	QuantumResistantTime  uint64    `json:"quantumResistantTime"`
 	CreatedAt             time.Time `json:"createdAt"`
@@ -1260,6 +1355,13 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 	if !isValidAddress(to) {
 		return "", fmt.Errorf("invalid shielded payout address %q", payment.Wallet)
 	}
+	if !isValidViewKey(payment.RecipientViewKey) {
+		return "", fmt.Errorf("miner %s must reconnect with a tkmshield2 payment code before receiving shielded payouts", to)
+	}
+	change, err := p.shieldedPayoutChangeRecipient()
+	if err != nil {
+		return "", err
+	}
 	payment.Amount = effectiveShieldedPayoutAmount(payment.Amount)
 	if payment.Amount <= 0 {
 		return "", errors.New("shielded payout amount must be positive")
@@ -1275,6 +1377,8 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 		AmountAntd:            round(payment.Amount),
 		AmountWei:             "0x" + amountWei.Text(16),
 		PayoutTxType:          txType,
+		RecipientViewKey:      "0x" + strings.ToLower(strings.TrimPrefix(payment.RecipientViewKey, "0x")),
+		ChangeViewKey:         "0x" + change.ViewKey,
 		PrivacyCommitmentTime: p.cfg.PrivacyCommitmentTime,
 		QuantumResistantTime:  p.cfg.QuantumResistantTime,
 		CreatedAt:             payment.CreatedAt,
@@ -1319,6 +1423,17 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 	return txHash, nil
 }
 
+func (p *Pool) shieldedPayoutChangeRecipient() (shieldedRecipient, error) {
+	change, err := parseShieldedPaymentCode(p.cfg.ShieldedPayoutChangeCode)
+	if err != nil {
+		return shieldedRecipient{}, fmt.Errorf("shieldedPayoutChangeCode is required for recoverable pool change notes: %w", err)
+	}
+	if !strings.EqualFold(change.Address, normalizeAddress(p.cfg.PoolWallet)) {
+		return shieldedRecipient{}, errors.New("shieldedPayoutChangeCode address does not match poolWallet")
+	}
+	return change, nil
+}
+
 func (p *Pool) payDue(ctx context.Context) {
 	p.payDueWithConfirmations(ctx, p.cfg.PaymentConfirmations)
 }
@@ -1333,7 +1448,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 	var due []Payment
 	for wallet, balance := range p.balances {
 		if balance >= p.cfg.MinPayoutAntd {
-			due = append(due, Payment{Wallet: wallet, Amount: round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd)), Status: "pending", CreatedAt: time.Now()})
+			due = append(due, Payment{Wallet: wallet, RecipientViewKey: p.recipientViewKeys[wallet], Amount: round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd)), Status: "pending", CreatedAt: time.Now()})
 		}
 	}
 	p.mu.RUnlock()
@@ -1542,6 +1657,9 @@ func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 
 	var blockers []string
 	if status.ShieldedPayoutsEnabled {
+		if _, err := p.shieldedPayoutChangeRecipient(); err != nil {
+			blockers = append(blockers, err.Error())
+		}
 		health, err := p.shieldedPayoutProverHealth(ctx)
 		if err != nil {
 			status.ShieldedPayoutProverError = err.Error()

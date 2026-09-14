@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,11 @@ import (
 	"testing"
 	"time"
 )
+
+func testShieldedCode(address, viewKey string) string {
+	payload, _ := json.Marshal(map[string]any{"v": 2, "c": 8979, "a": address, "k": viewKey})
+	return "tkmshield2." + base64.RawURLEncoding.EncodeToString(payload)
+}
 
 func TestSendShieldedPaymentCallsConfiguredProver(t *testing.T) {
 	const (
@@ -40,10 +46,11 @@ func TestSendShieldedPaymentCallsConfiguredProver(t *testing.T) {
 			QuantumResistantTime:      tkmPrivacyQuantumActivationUnix,
 			ShieldedPayoutProverURL:   server.URL,
 			ShieldedPayoutProverToken: token,
+			ShieldedPayoutChangeCode:  testShieldedCode(poolWallet, strings.Repeat("1", 64)),
 		},
 		rpc: &RPCClient{client: server.Client()},
 	}
-	payment := Payment{Wallet: toWallet, Amount: 5, CreatedAt: time.Unix(1786428000, 0).UTC()}
+	payment := Payment{Wallet: toWallet, RecipientViewKey: strings.Repeat("2", 64), Amount: 5, CreatedAt: time.Unix(1786428000, 0).UTC()}
 
 	hash, err := pool.sendShieldedPayment(context.Background(), payment, pqTxTypeHex)
 	if err != nil {
@@ -64,6 +71,9 @@ func TestSendShieldedPaymentCallsConfiguredProver(t *testing.T) {
 	if got.PayoutTxType != pqTxTypeHex {
 		t.Fatalf("payout tx type = %q", got.PayoutTxType)
 	}
+	if got.RecipientViewKey != "0x"+strings.Repeat("2", 64) || got.ChangeViewKey != "0x"+strings.Repeat("1", 64) {
+		t.Fatalf("view keys = recipient %q change %q", got.RecipientViewKey, got.ChangeViewKey)
+	}
 }
 
 func TestSendShieldedPaymentCapsLargeAmountToUint64CircuitLimit(t *testing.T) {
@@ -83,17 +93,19 @@ func TestSendShieldedPaymentCapsLargeAmountToUint64CircuitLimit(t *testing.T) {
 
 	pool := &Pool{
 		cfg: Config{
-			PoolWallet:              poolWallet,
-			RedisStateKey:           "test:payouts",
-			ShieldedPayoutProverURL: server.URL,
+			PoolWallet:               poolWallet,
+			RedisStateKey:            "test:payouts",
+			ShieldedPayoutProverURL:  server.URL,
+			ShieldedPayoutChangeCode: testShieldedCode(poolWallet, strings.Repeat("1", 64)),
 		},
 		rpc: &RPCClient{client: server.Client()},
 	}
 
 	hash, err := pool.sendShieldedPayment(context.Background(), Payment{
-		Wallet:    toWallet,
-		Amount:    1000,
-		CreatedAt: time.Unix(1786428000, 0).UTC(),
+		Wallet:           toWallet,
+		RecipientViewKey: strings.Repeat("2", 64),
+		Amount:           1000,
+		CreatedAt:        time.Unix(1786428000, 0).UTC(),
 	}, pqTxTypeHex)
 	if err != nil {
 		t.Fatalf("sendShieldedPayment returned error: %v", err)
@@ -142,16 +154,18 @@ func TestSendShieldedPaymentRejectsInvalidProverHash(t *testing.T) {
 
 	pool := &Pool{
 		cfg: Config{
-			PoolWallet:              "0xf03a2a24c8926dba5a44301c751aec047b60b0a6",
-			RedisStateKey:           "test:payouts",
-			ShieldedPayoutProverURL: server.URL,
+			PoolWallet:               "0xf03a2a24c8926dba5a44301c751aec047b60b0a6",
+			RedisStateKey:            "test:payouts",
+			ShieldedPayoutProverURL:  server.URL,
+			ShieldedPayoutChangeCode: testShieldedCode("0xf03a2a24c8926dba5a44301c751aec047b60b0a6", strings.Repeat("1", 64)),
 		},
 		rpc: &RPCClient{client: server.Client()},
 	}
 	_, err := pool.sendShieldedPayment(context.Background(), Payment{
-		Wallet:    "0x4441d6fed0836b77a503e0b2788bfed6fd8c23a8",
-		Amount:    1,
-		CreatedAt: time.Now(),
+		Wallet:           "0x4441d6fed0836b77a503e0b2788bfed6fd8c23a8",
+		RecipientViewKey: strings.Repeat("2", 64),
+		Amount:           1,
+		CreatedAt:        time.Now(),
 	}, "")
 	if err == nil || !strings.Contains(err.Error(), "invalid tx hash") {
 		t.Fatalf("error = %v, want invalid tx hash", err)

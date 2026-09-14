@@ -93,7 +93,8 @@ To enable shielded payouts, run a separate prover service on a private host that
 ```json
 {
   "shieldedPayoutProverURL": "http://127.0.0.1:8787/payout",
-  "shieldedPayoutProverToken": "change-this-token"
+  "shieldedPayoutProverToken": "change-this-token",
+  "shieldedPayoutChangeCode": "tkmshield2.<pool-wallet-public-payment-code>"
 }
 ```
 
@@ -104,6 +105,8 @@ The pool sends one `POST` per payout:
   "requestId": "stable-idempotency-key",
   "poolWallet": "0xYourPoolWallet",
   "to": "0xMinerPayoutWallet",
+  "recipientViewKey": "0x<32-byte-public-viewing-key-from-miner-shield2-code>",
+  "changeViewKey": "0x<32-byte-public-viewing-key-from-pool-shield2-code>",
   "amountAntd": 5,
   "amountWei": "0x4563918244f40000",
   "payoutTxType": "0x6",
@@ -145,6 +148,8 @@ If `shieldedPayoutProverToken` is set, the pool sends `Authorization: Bearer <to
 ```
 
 Only after a valid 32-byte transaction hash is returned does the pool mark the payout as `sent` and deduct the miner's Redis balance. If the prover is down or returns an error, the payout remains owed and is retried with the same `requestId` sequence until a sent payout is recorded. The prover should therefore persist request IDs and return the same hash for duplicate requests.
+
+Miners must connect using their full `tkmshield2` payment code after privacy activation, optionally followed by `.worker-name`. The pool extracts the public recipient viewing key and gives it to the prover, so the payout note is encrypted for the miner. Set `shieldedPayoutChangeCode` to the full `tkmshield2` code for the same address as `poolWallet`; this keeps each pool change note recoverable for the next payout. A legacy `0x...` login may still mine and accrue balance, but shielded payout remains safely pending until that miner reconnects with Shield2.
 
 Redis setup for payment state:
 
