@@ -61,6 +61,7 @@ type Config struct {
 	ShieldedPayoutProverURL   string  `json:"shieldedPayoutProverURL"`
 	ShieldedPayoutProverToken string  `json:"shieldedPayoutProverToken"`
 	ShieldedPayoutChangeCode  string  `json:"shieldedPayoutChangeCode"`
+	ShieldedPayoutApplication string  `json:"shieldedPayoutApplication"`
 }
 
 type PayoutState struct {
@@ -1208,6 +1209,7 @@ func (p *Pool) shieldedPayoutProverConfigured() bool {
 
 type ShieldedPayoutRequest struct {
 	RequestID             string    `json:"requestId"`
+	ApplicationData       string    `json:"applicationData,omitempty"`
 	PoolWallet            string    `json:"poolWallet"`
 	To                    string    `json:"to"`
 	AmountAntd            float64   `json:"amountAntd"`
@@ -1235,6 +1237,8 @@ type ShieldedPayoutProverHealth struct {
 	AvailableNoteMaxWei string `json:"availableNoteMaxWei"`
 	NoteInventoryError  string `json:"noteInventoryError"`
 	StartupError        string `json:"startupError"`
+	SignMode            string `json:"signMode"`
+	HasKeystore         bool   `json:"hasKeystore"`
 }
 
 func (p *Pool) shieldedPayoutRequestID(payment Payment) string {
@@ -1372,6 +1376,7 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 	}
 	reqBody, err := json.Marshal(ShieldedPayoutRequest{
 		RequestID:             p.shieldedPayoutRequestID(payment),
+		ApplicationData:       p.shieldedPayoutApplicationData(payment),
 		PoolWallet:            normalizeAddress(p.cfg.PoolWallet),
 		To:                    to,
 		AmountAntd:            round(payment.Amount),
@@ -1421,6 +1426,14 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 		return "", fmt.Errorf("prover returned invalid tx hash %q status=%q", out.TxHash, out.Status)
 	}
 	return txHash, nil
+}
+
+func (p *Pool) shieldedPayoutApplicationData(payment Payment) string {
+	prefix := strings.TrimSpace(p.cfg.ShieldedPayoutApplication)
+	if prefix == "" {
+		prefix = "TKM_POOL_PAYOUT_V1"
+	}
+	return prefix + ":" + p.shieldedPayoutRequestID(payment)
 }
 
 func (p *Pool) shieldedPayoutChangeRecipient() (shieldedRecipient, error) {
@@ -1570,6 +1583,9 @@ func (p *Pool) payDueShielded(ctx context.Context, due []Payment, txType string)
 		case !health.HasSpendableNotes || health.AvailableNoteCount == 0:
 			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover has no spendable shielded notes")
 			continue
+		case strings.EqualFold(strings.TrimSpace(health.SignMode), "proof-only") || !health.HasKeystore:
+			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover is not configured with a signing keystore")
+			continue
 		}
 		payment.Amount = effectiveShieldedPayoutAmountForNote(payment.Amount, health.AvailableNoteMaxWei)
 		if payment.Amount <= 0 {
@@ -1678,6 +1694,8 @@ func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 				blockers = append(blockers, "shielded payout note inventory error: "+health.NoteInventoryError)
 			case !health.HasSpendableNotes || health.AvailableNoteCount == 0:
 				blockers = append(blockers, "shielded payout prover has no spendable shielded notes")
+			case strings.EqualFold(strings.TrimSpace(health.SignMode), "proof-only") || !health.HasKeystore:
+				blockers = append(blockers, "shielded payout prover requires a signing keystore; proof-only mode cannot send pool payouts")
 			case maxNoteWei == nil || maxNoteWei.Cmp(minPayoutWei) < 0:
 				blockers = append(blockers, fmt.Sprintf("shielded payout prover max note is below minimum payout %.8f TKM", p.cfg.MinPayoutAntd))
 			default:
