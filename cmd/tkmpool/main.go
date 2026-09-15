@@ -1447,7 +1447,9 @@ func (p *Pool) shieldedPayoutApplicationData(payment Payment) string {
 	if prefix == "" {
 		prefix = "TKM_POOL_PAYOUT_V1"
 	}
-	return prefix + ":" + p.shieldedPayoutRequestID(payment)
+	// The prover feeds applicationData directly into the shielded circuit and
+	// requires a 0x-prefixed hexadecimal byte string.
+	return "0x" + hex.EncodeToString([]byte(prefix+":"+p.shieldedPayoutRequestID(payment)))
 }
 
 func (p *Pool) shieldedPayoutChangeRecipient() (shieldedRecipient, error) {

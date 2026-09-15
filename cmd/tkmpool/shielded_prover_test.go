@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -61,6 +62,13 @@ func TestSendShieldedPaymentCallsConfiguredProver(t *testing.T) {
 	}
 	if got.RequestID == "" || len(got.RequestID) != 64 {
 		t.Fatalf("request id = %q, want 64 hex chars", got.RequestID)
+	}
+	if !strings.HasPrefix(got.ApplicationData, "0x") {
+		t.Fatalf("application data = %q, want 0x-prefixed hex", got.ApplicationData)
+	}
+	decodedApplicationData, err := hex.DecodeString(strings.TrimPrefix(got.ApplicationData, "0x"))
+	if err != nil || !strings.HasPrefix(string(decodedApplicationData), "TKM_POOL_PAYOUT_V1:") {
+		t.Fatalf("application data = %q, want encoded TKM payout prefix", got.ApplicationData)
 	}
 	if got.PoolWallet != poolWallet || got.To != toWallet {
 		t.Fatalf("request wallets = pool %q to %q", got.PoolWallet, got.To)
