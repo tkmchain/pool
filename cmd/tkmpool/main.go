@@ -1748,8 +1748,6 @@ func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 				blockers = append(blockers, reason)
 			case health.NoteInventoryError != "":
 				blockers = append(blockers, "shielded payout note inventory error: "+health.NoteInventoryError)
-			case !health.HasSpendableNotes || health.AvailableNoteCount == 0:
-				blockers = append(blockers, "shielded payout prover has no spendable shielded notes")
 			case strings.EqualFold(strings.TrimSpace(health.SignMode), "proof-only") || !health.HasKeystore:
 				blockers = append(blockers, "shielded payout prover requires a signing keystore; proof-only mode cannot send pool payouts")
 			case maxNoteWei == nil || maxNoteWei.Cmp(minPayoutWei) < 0:
