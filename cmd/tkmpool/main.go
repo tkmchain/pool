@@ -2220,7 +2220,7 @@ func isTransientStateReadError(err error) bool {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "layer stale") || strings.Contains(msg, "missing trie node") || strings.Contains(msg, "getstateobject")
+	return strings.Contains(msg, "layer stale") || strings.Contains(msg, "missing trie node") || strings.Contains(msg, "getstateobject") || strings.Contains(msg, "historical state")
 }
 
 func (r *RPCClient) GetWork(ctx context.Context) (Work, error) {
@@ -2373,7 +2373,18 @@ func (r *RPCClient) BalanceAt(ctx context.Context, address, block string) (*big.
 	}
 	var balanceHex string
 	if err := r.callWithStateRetry(ctx, "eth_getBalance", []any{address, block}, &balanceHex); err != nil {
-		return nil, err
+		// Some daemon states cannot answer the synthetic pending tag while
+		// pruning historical layers. Latest is safe for dashboard/payout checks.
+		if strings.EqualFold(block, "pending") && isTransientStateReadError(err) {
+			if fallbackErr := r.callWithStateRetry(ctx, "eth_getBalance", []any{address, "latest"}, &balanceHex); fallbackErr == nil {
+				err = nil
+			} else {
+				return nil, fallbackErr
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	balance, ok := parseBigFlexible(balanceHex)
 	if !ok {
