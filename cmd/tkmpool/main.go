@@ -1740,8 +1740,6 @@ func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 			status.ShieldedPayoutAvailableNotes = health.AvailableNoteCount
 			status.ShieldedPayoutMaxNoteWei = health.AvailableNoteMaxWei
 			status.ShieldedPayoutProverError = firstNonEmpty(health.NoteInventoryError, health.StartupError)
-			maxNoteWei, _ := parseBigFlexible(health.AvailableNoteMaxWei)
-			minPayoutWei := antdToWeiInt(p.cfg.MinPayoutAntd)
 			switch {
 			case !health.OK:
 				reason := firstNonEmpty(health.StartupError, "shielded payout prover is not ready")
@@ -1750,8 +1748,6 @@ func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 				blockers = append(blockers, "shielded payout note inventory error: "+health.NoteInventoryError)
 			case strings.EqualFold(strings.TrimSpace(health.SignMode), "proof-only") || !health.HasKeystore:
 				blockers = append(blockers, "shielded payout prover requires a signing keystore; proof-only mode cannot send pool payouts")
-			case maxNoteWei == nil || maxNoteWei.Cmp(minPayoutWei) < 0:
-				blockers = append(blockers, fmt.Sprintf("shielded payout prover max note is below minimum payout %.8f TKM", p.cfg.MinPayoutAntd))
 			default:
 				status.ShieldedPayoutProverReady = true
 			}
