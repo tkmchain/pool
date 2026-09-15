@@ -1389,8 +1389,17 @@ func (p *Pool) createShieldedLiquidityNote(ctx context.Context, amount float64) 
 		return err
 	}
 	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	// The prover returns HTTP 400 when submission is still pending, but the
+	// transaction hash is authoritative and must be tracked as unconfirmed.
+	var result struct {
+		TxHash string `json:"txHash"`
+	}
+	_ = json.Unmarshal(b, &result)
+	if strings.TrimSpace(result.TxHash) != "" && isValidHash(result.TxHash) {
+		return nil
+	}
 	if resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("deposit HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
 	}
 	return nil
