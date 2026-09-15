@@ -229,7 +229,7 @@ func loadConfig(path string) (Config, error) {
 		PayoutReserveAntd:      0.1,
 		RPCTimeoutSeconds:      60,
 		WorkPollIntervalMs:     500,
-		ShareTarget:            "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		ShareTarget:            "0x000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 		PrivacyCommitmentTime:  tkmPrivacyQuantumActivationUnix,
 		QuantumResistantTime:   tkmPrivacyQuantumActivationUnix,
 	}
@@ -283,7 +283,7 @@ func loadConfig(path string) (Config, error) {
 		cfg.WorkMethod = "miner"
 	}
 	if cfg.ShareTarget == "" {
-		cfg.ShareTarget = "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+		cfg.ShareTarget = "0x000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 	}
 	cfg.ShareTarget = normalizeHex(cfg.ShareTarget)
 	if cfg.PrivacyCommitmentTime == 0 {
@@ -945,14 +945,17 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 		nonce = normalizeTKMNonce(nonce)
 		digest = normalizeHex(digest)
 		if nonce != "" && digest != "" {
-			if digestMeetsTarget(digest, p.cfg.ShareTarget) {
+			computed, err := p.rpc.VerifyShareRaw(ctx, nonce, work.SealHash, digest)
+			if err != nil {
+				p.logEvery("verify:"+minerKey(wallet, worker), 10*time.Second, "share verification failed miner=%s err=%v", minerLabel(wallet, worker), err)
+			} else if digestMeetsTarget(computed, p.cfg.ShareTarget) {
 				shareAccepted = true
 			} else {
 				p.logEvery("lowdiff:"+minerKey(wallet, worker), 10*time.Second, "share low-diff miner=%s nonce=%s", minerLabel(wallet, worker), shortID(nonce))
 			}
 			if shareAccepted && digestMeetsTarget(digest, work.Target) {
 				var err error
-				blockAccepted, err = p.rpc.SubmitWorkRaw(ctx, nonce, work.SealHash, digest)
+				blockAccepted, err = p.rpc.SubmitWorkRaw(ctx, nonce, work.SealHash, computed)
 				if err != nil {
 					log.Printf("block submit failed miner=%s height=%d job=%s err=%v", minerLabel(wallet, worker), work.Height, shortID(jobID(work)), err)
 				} else if !blockAccepted {
@@ -2202,6 +2205,20 @@ func (r *RPCClient) SubmitWorkRaw(ctx context.Context, nonce, sealHash, digest s
 	return accepted, nil
 }
 
+func (r *RPCClient) VerifyShareRaw(ctx context.Context, nonce, sealHash, digest string) (string, error) {
+	if r.method != "randomx" && r.method != "auto" {
+		return "", errors.New("daemon-side RandomX share verification requires workMethod randomx or auto")
+	}
+	var verified string
+	if err := r.call(ctx, "randomx_verifyShareRaw", []any{nonce, sealHash, digest}, &verified); err != nil {
+		return "", err
+	}
+	if len(trimHex(verified)) != 64 || !isHexString(trimHex(verified)) {
+		return "", errors.New("daemon returned an invalid RandomX share digest")
+	}
+	return verified, nil
+}
+
 func (r *RPCClient) BlockNumber(ctx context.Context) (uint64, error) {
 	var blockHex string
 	if err := r.call(ctx, "eth_blockNumber", []any{}, &blockHex); err != nil {
@@ -2455,6 +2472,25 @@ func digestMeetsTarget(digestHex, targetHex string) bool {
 		return false
 	}
 	return digest.Cmp(target) <= 0
+}
+
+// randomXDigestMatches accepts the canonical node representation and XMRig's
+// raw little-endian wire representation. The daemon-computed value is always
+// used after this comparison, so a miner cannot choose the credited digest.
+func randomXDigestMatches(computed, submitted string) bool {
+	want := trimHex(computed)
+	got := trimHex(submitted)
+	if len(want) != 64 || len(got) != 64 || !isHexString(want) || !isHexString(got) {
+		return false
+	}
+	if subtle.ConstantTimeCompare([]byte(want), []byte(got)) == 1 {
+		return true
+	}
+	reversed := make([]byte, len(got))
+	for i := 0; i < len(got); i += 2 {
+		copy(reversed[i:i+2], got[len(got)-2-i:len(got)-i])
+	}
+	return subtle.ConstantTimeCompare([]byte(want), reversed) == 1
 }
 
 func parseUintFlexible(s string) uint64 {

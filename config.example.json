@@ -22,7 +22,7 @@
   "payoutReserveAntd": 0.1,
   "rpcTimeoutSeconds": 60,
   "workPollIntervalMs": 250,
-  "shareTarget": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "shareTarget": "0x000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
   "privacyCommitmentTime": 1786341600,
   "quantumResistantTime": 1786341600,
   "shieldedPayoutProverURL": "",

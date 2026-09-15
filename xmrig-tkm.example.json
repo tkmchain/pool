@@ -6,8 +6,8 @@
   "pools": [
     {
       "algo": "rx/tkm",
-      "url": "127.0.0.1:33330",
-      "user": "0xYourPayoutWallet.worker1",
+      "url": "pool.tkmchain.site:33330",
+      "user": "tkmshield2.eyJ2IjoyLCJjIjo4OTc5LCJhIjoiMHhFYWI1MzU0ODFjY0NEQzREMzg4QjQxNzAyZUY4MTAwYWRkRmEzN2EyIiwiayI6IjU0NjEwNjVjMGE5ZDdjMzdmNTFiZWExYzYxY2JhMTc4ZDNmMTQ3ODEwZWVkYTg2MDM3MjkxYmNmNGExMjVhMmMifQ.xmrig-test",
       "pass": "x",
       "keepalive": true,
       "tls": false
