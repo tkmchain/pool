@@ -2375,7 +2375,7 @@ func (r *RPCClient) BalanceAt(ctx context.Context, address, block string) (*big.
 	if err := r.callWithStateRetry(ctx, "eth_getBalance", []any{address, block}, &balanceHex); err != nil {
 		// Some daemon states cannot answer the synthetic pending tag while
 		// pruning historical layers. Latest is safe for dashboard/payout checks.
-		if strings.EqualFold(block, "pending") && isTransientStateReadError(err) {
+		if isTransientStateReadError(err) {
 			if fallbackErr := r.callWithStateRetry(ctx, "eth_getBalance", []any{address, "latest"}, &balanceHex); fallbackErr == nil {
 				err = nil
 			} else {
