@@ -1649,7 +1649,11 @@ func (p *Pool) payDueShielded(ctx context.Context, due []Payment, txType string)
 			continue
 		}
 		if payment.Amount < p.cfg.MinPayoutAntd {
-			p.recordPaymentStatuses([]Payment{payment}, fmt.Sprintf("waiting: shielded payout prover max note is below minimum payout %.8f TKM", p.cfg.MinPayoutAntd))
+			if err := p.createShieldedLiquidityNote(ctx, originalAmount); err != nil {
+				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note creation: "+err.Error())
+			} else {
+				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note is being confirmed")
+			}
 			continue
 		}
 		if payment.Amount != round(originalAmount) {
