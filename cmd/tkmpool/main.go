@@ -1356,6 +1356,42 @@ func (p *Pool) shieldedPayoutProverHealth(ctx context.Context) (ShieldedPayoutPr
 	return out, nil
 }
 
+func (p *Pool) createShieldedLiquidityNote(ctx context.Context, amount float64) error {
+	endpoint := strings.TrimSpace(p.cfg.ShieldedPayoutProverURL)
+	if endpoint == "" {
+		return errors.New("shielded payout prover URL is not configured")
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return err
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/payout") + "/deposit"
+	amount = minFloat(round(amount), shieldedMaxPayoutPerTxAntd)
+	wei := antdToWeiInt(amount)
+	body, err := json.Marshal(map[string]any{"requestId": fmt.Sprintf("pool-liquidity-%d", time.Now().UnixNano()), "amountAntd": amount, "amountWei": "0x" + wei.Text(16), "from": normalizeAddress(p.cfg.PoolWallet), "to": normalizeAddress(p.cfg.PoolWallet), "createdAt": time.Now().UTC()})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("content-type", "application/json")
+	if t := strings.TrimSpace(p.cfg.ShieldedPayoutProverToken); t != "" {
+		req.Header.Set("authorization", "Bearer "+t)
+	}
+	resp, err := p.rpc.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("deposit HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	return nil
+}
+
 func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType string) (string, error) {
 	endpoint := strings.TrimSpace(p.cfg.ShieldedPayoutProverURL)
 	if endpoint == "" {
@@ -1597,7 +1633,11 @@ func (p *Pool) payDueShielded(ctx context.Context, due []Payment, txType string)
 			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout note inventory error: "+health.NoteInventoryError)
 			continue
 		case !health.HasSpendableNotes || health.AvailableNoteCount == 0:
-			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover has no spendable shielded notes")
+			if err := p.createShieldedLiquidityNote(ctx, payment.Amount); err != nil {
+				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note creation: "+err.Error())
+			} else {
+				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note is being confirmed")
+			}
 			continue
 		case strings.EqualFold(strings.TrimSpace(health.SignMode), "proof-only") || !health.HasKeystore:
 			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover is not configured with a signing keystore")
