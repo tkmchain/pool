@@ -1470,6 +1470,13 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		var pending struct {
+			TxHash string `json:"txHash"`
+		}
+		_ = json.Unmarshal(body, &pending)
+		if isValidHash(pending.TxHash) {
+			return strings.ToLower(normalizeHex(pending.TxHash)), nil
+		}
 		return "", fmt.Errorf("prover returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
