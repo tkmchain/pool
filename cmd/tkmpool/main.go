@@ -1366,9 +1366,13 @@ func (p *Pool) createShieldedLiquidityNote(ctx context.Context, amount float64) 
 		return err
 	}
 	u.Path = strings.TrimSuffix(u.Path, "/payout") + "/deposit"
+	change, err := p.shieldedPayoutChangeRecipient()
+	if err != nil {
+		return err
+	}
 	amount = minFloat(round(amount), shieldedMaxPayoutPerTxAntd)
 	wei := antdToWeiInt(amount)
-	body, err := json.Marshal(map[string]any{"requestId": fmt.Sprintf("pool-liquidity-%d", time.Now().UnixNano()), "amountAntd": amount, "amountWei": "0x" + wei.Text(16), "from": normalizeAddress(p.cfg.PoolWallet), "to": normalizeAddress(p.cfg.PoolWallet), "createdAt": time.Now().UTC()})
+	body, err := json.Marshal(map[string]any{"requestId": fmt.Sprintf("pool-liquidity-%d", time.Now().UnixNano()), "amountAntd": amount, "amountWei": "0x" + wei.Text(16), "from": normalizeAddress(p.cfg.PoolWallet), "to": normalizeAddress(p.cfg.PoolWallet), "recipientViewKey": "0x" + change.ViewKey, "createdAt": time.Now().UTC()})
 	if err != nil {
 		return err
 	}
