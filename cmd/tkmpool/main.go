@@ -1150,12 +1150,16 @@ func isHexString(s string) bool {
 }
 
 func (p *Pool) paymentLoop(ctx context.Context) {
+	confirmations := time.NewTicker(15 * time.Second)
+	defer confirmations.Stop()
 	ticker := time.NewTicker(time.Duration(p.cfg.PaymentIntervalSeconds) * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-confirmations.C:
+			p.refreshLiquidityReceipts(ctx)
 		case <-ticker.C:
 			if p.cfg.AutoPay {
 				p.payDue(ctx)
@@ -1356,6 +1360,43 @@ func (p *Pool) shieldedPayoutProverHealth(ctx context.Context) (ShieldedPayoutPr
 	return out, nil
 }
 
+func (p *Pool) refreshLiquidityReceipts(ctx context.Context) {
+	p.mu.RLock()
+	pending := make([]Payment, 0)
+	for _, payment := range p.payments {
+		if payment.Status == "unconfirmed: shielded liquidity deposit" && isValidHash(payment.TxHash) {
+			pending = append(pending, payment)
+		}
+	}
+	p.mu.RUnlock()
+	for _, payment := range pending {
+		var receipt *struct {
+			Status          string `json:"status"`
+			BlockNumber     string `json:"blockNumber"`
+			TransactionHash string `json:"transactionHash"`
+		}
+		if err := p.rpc.call(ctx, "eth_getTransactionReceipt", []any{payment.TxHash}, &receipt); err != nil || receipt == nil || receipt.BlockNumber == "" || !strings.EqualFold(receipt.TransactionHash, payment.TxHash) {
+			continue
+		}
+		status, ok := parseBigFlexible(receipt.Status)
+		if !ok {
+			continue
+		}
+		label := "failed: shielded liquidity deposit reverted"
+		if status.Uint64() == 1 {
+			label = "confirmed: shielded liquidity deposit"
+		}
+		p.mu.Lock()
+		for i := range p.payments {
+			if p.payments[i].TxHash == payment.TxHash && p.payments[i].Status == "unconfirmed: shielded liquidity deposit" {
+				p.payments[i].Status = label
+			}
+		}
+		p.savePayoutStateLocked()
+		p.mu.Unlock()
+	}
+}
+
 func (p *Pool) createShieldedLiquidityNote(ctx context.Context, amount float64) error {
 	endpoint := strings.TrimSpace(p.cfg.ShieldedPayoutProverURL)
 	if endpoint == "" {
@@ -1397,6 +1438,11 @@ func (p *Pool) createShieldedLiquidityNote(ctx context.Context, amount float64) 
 	}
 	_ = json.Unmarshal(b, &result)
 	if strings.TrimSpace(result.TxHash) != "" && isValidHash(result.TxHash) {
+		p.mu.Lock()
+		p.payments = append(p.payments, Payment{Wallet: normalizeAddress(p.cfg.PoolWallet), Amount: amount, TxHash: result.TxHash, Status: "unconfirmed: shielded liquidity deposit", CreatedAt: time.Now()})
+		p.savePayoutStateLocked()
+		p.mu.Unlock()
+		p.refreshLiquidityReceipts(ctx)
 		return nil
 	}
 	if resp.StatusCode >= 300 {
@@ -1655,8 +1701,6 @@ func (p *Pool) payDueShielded(ctx context.Context, due []Payment, txType string)
 		case !health.HasSpendableNotes || health.AvailableNoteCount == 0:
 			if err := p.createShieldedLiquidityNote(ctx, payment.Amount); err != nil {
 				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note creation: "+err.Error())
-			} else {
-				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note is being confirmed")
 			}
 			continue
 		case strings.EqualFold(strings.TrimSpace(health.SignMode), "proof-only") || !health.HasKeystore:
@@ -1671,8 +1715,6 @@ func (p *Pool) payDueShielded(ctx context.Context, due []Payment, txType string)
 		if payment.Amount < p.cfg.MinPayoutAntd {
 			if err := p.createShieldedLiquidityNote(ctx, originalAmount); err != nil {
 				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note creation: "+err.Error())
-			} else {
-				p.recordPaymentStatuses([]Payment{payment}, "waiting: daemon-funded shielded note is being confirmed")
 			}
 			continue
 		}
