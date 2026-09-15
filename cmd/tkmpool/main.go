@@ -658,11 +658,11 @@ func (p *Pool) handleStratum(conn net.Conn) {
 				session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": false, "error": map[string]any{"code": -1, "message": "unauthorized"}})
 				continue
 			}
-			ok := p.submitShare(context.Background(), wallet, worker, req.Params, session)
+			ok, reason := p.submitShare(context.Background(), wallet, worker, req.Params, session)
 			if ok {
 				session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": map[string]any{"status": "OK"}, "error": nil})
 			} else {
-				session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": nil, "error": map[string]any{"code": -1, "message": "rejected"}})
+				session.write(map[string]any{"id": jsonRPCResponseID(req.ID), "jsonrpc": "2.0", "result": nil, "error": map[string]any{"code": -1, "message": reason}})
 				p.logEvery("xmrigreject:"+minerKey(wallet, worker), 10*time.Second, "xmrig share rejected miner=%s", minerLabel(wallet, worker))
 			}
 		case "keepalived":
@@ -690,8 +690,8 @@ func (p *Pool) handleStratum(conn net.Conn) {
 				session.write(map[string]any{"id": req.ID, "result": false, "error": "unauthorized"})
 				continue
 			}
-			ok := p.submitShare(context.Background(), wallet, worker, req.Params, session)
-			session.write(map[string]any{"id": req.ID, "result": ok, "error": nil})
+			ok, reason := p.submitShare(context.Background(), wallet, worker, req.Params, session)
+			session.write(map[string]any{"id": req.ID, "result": ok, "error": shareResponseError(ok, reason)})
 		case "mining.extranonce.subscribe":
 			session.write(map[string]any{"id": req.ID, "result": true, "error": nil})
 		default:
@@ -923,7 +923,7 @@ func (p *Pool) logEvery(key string, interval time.Duration, format string, args 
 	log.Printf(format, args...)
 }
 
-func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage, session *stratumSession) bool {
+func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.RawMessage, session *stratumSession) (bool, string) {
 	job, nonce, digest := parseShareSubmission(raw)
 	p.mu.RLock()
 	work := p.work
@@ -936,24 +936,32 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 			p.notify(session, work)
 		}
 		p.recordRejectedShare(wallet, worker)
-		return false
+		return false, "stale or unknown job"
 	}
 
+	reason := "invalid nonce or digest"
 	shareAccepted := false
 	blockAccepted := false
 	if work.SealHash != "" {
 		nonce = normalizeTKMNonce(nonce)
 		digest = normalizeHex(digest)
-		if nonce != "" && digest != "" {
+		if nonce != "" && isValidHash(digest) {
 			computed, err := p.rpc.VerifyShareRaw(ctx, nonce, work.SealHash, digest)
 			if err != nil {
-				p.logEvery("verify:"+minerKey(wallet, worker), 10*time.Second, "share verification failed miner=%s err=%v", minerLabel(wallet, worker), err)
-			} else if digestMeetsTarget(computed, p.cfg.ShareTarget) {
+				reason = "RandomX verification unavailable; see pool logs"
+				if strings.Contains(err.Error(), "submitted digest does not match") {
+					reason = "RandomX hash mismatch: submitted result differs from node calculation"
+				} else if strings.Contains(err.Error(), "stale or unknown") {
+					reason = "stale or unknown job at node"
+				}
+				p.logEvery("verify:"+minerKey(wallet, worker), 10*time.Second, "share verification failed miner=%s nonce=%s digest=%s err=%v", minerLabel(wallet, worker), nonce, digest, err)
+			} else if randomXMeetsTarget(computed, p.cfg.ShareTarget) {
 				shareAccepted = true
 			} else {
+				reason = "share difficulty below pool target"
 				p.logEvery("lowdiff:"+minerKey(wallet, worker), 10*time.Second, "share low-diff miner=%s nonce=%s", minerLabel(wallet, worker), shortID(nonce))
 			}
-			if shareAccepted && digestMeetsTarget(digest, work.Target) {
+			if shareAccepted && randomXMeetsTarget(computed, work.Target) {
 				var err error
 				blockAccepted, err = p.rpc.SubmitWorkRaw(ctx, nonce, work.SealHash, computed)
 				if err != nil {
@@ -991,7 +999,10 @@ func (p *Pool) submitShare(ctx context.Context, wallet, worker string, raw json.
 			go p.payDueWithConfirmations(context.Background(), 0)
 		}
 	}
-	return shareAccepted
+	if shareAccepted {
+		return true, ""
+	}
+	return false, reason
 }
 
 func parseShareSubmission(raw json.RawMessage) (job, nonce, digest string) {
@@ -2993,3 +3004,22 @@ const adminHTML = `<!doctype html>
   </script>
 </body>
 </html>`
+
+func shareResponseError(accepted bool, reason string) any {
+	if accepted {
+		return nil
+	}
+	return reason
+}
+
+// RandomX returns raw little-endian bytes; targets are big-endian integers.
+func randomXMeetsTarget(raw, target string) bool {
+	b, err := hex.DecodeString(trimHex(raw))
+	if err != nil || len(b) != 32 {
+		return false
+	}
+	for i, j := 0, len(b)-1; i < j; i, j = i+1, j-1 {
+		b[i], b[j] = b[j], b[i]
+	}
+	return digestMeetsTarget(hex.EncodeToString(b), target)
+}
