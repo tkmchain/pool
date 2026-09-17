@@ -31,5 +31,7 @@
   "shieldedPayoutApplication": "TKM_POOL_PAYOUT_V1",
   "publicURL": "http://127.0.0.1:33230",
   "explorerURL": "https://block.tkmchain.site",
-  "publicStratum": "127.0.0.1:33330"
+  "publicStratum": "127.0.0.1:33330",
+  "torSocks5Proxy": "",
+  "privacyStrict": false
 }

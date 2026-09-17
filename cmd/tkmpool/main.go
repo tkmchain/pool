@@ -19,6 +19,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strconv"
@@ -26,6 +27,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	xproxy "golang.org/x/net/proxy"
 )
 
 type Config struct {
@@ -62,6 +65,8 @@ type Config struct {
 	ShieldedPayoutProverToken string  `json:"shieldedPayoutProverToken"`
 	ShieldedPayoutChangeCode  string  `json:"shieldedPayoutChangeCode"`
 	ShieldedPayoutApplication string  `json:"shieldedPayoutApplication"`
+	TorSOCKS5Proxy            string  `json:"torSocks5Proxy"`
+	PrivacyStrict             bool    `json:"privacyStrict"`
 }
 
 type PayoutState struct {
@@ -232,6 +237,7 @@ func loadConfig(path string) (Config, error) {
 		ShareTarget:            "0x000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 		PrivacyCommitmentTime:  tkmPrivacyQuantumActivationUnix,
 		QuantumResistantTime:   tkmPrivacyQuantumActivationUnix,
+		TorSOCKS5Proxy:         "",
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -302,13 +308,101 @@ func loadConfig(path string) (Config, error) {
 	if cfg.RedisAddr == "" {
 		cfg.RedisAddr = "127.0.0.1:6379"
 	}
+	if err := validatePrivacyConfig(cfg); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
 }
 
+func validatePrivacyConfig(cfg Config) error {
+	if cfg.TorSOCKS5Proxy == "" {
+		if cfg.PrivacyStrict {
+			return errors.New("privacyStrict requires torSocks5Proxy")
+		}
+		return nil
+	}
+	u, err := url.Parse(cfg.TorSOCKS5Proxy)
+	if err != nil || u.Scheme != "socks5" || u.Hostname() == "" || u.Port() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("torSocks5Proxy must be a plain socks5://host:port URL")
+	}
+	if cfg.PrivacyStrict {
+		for name, endpoint := range map[string]string{"nodeRPC": cfg.NodeRPC, "prover": cfg.ShieldedPayoutProverURL} {
+			if endpoint == "" {
+				continue
+			}
+			parsed, err := url.Parse(endpoint)
+			if err != nil || parsed.Host == "" {
+				return fmt.Errorf("invalid %s endpoint", name)
+			}
+			if isLoopbackEndpoint(parsed.Hostname()) {
+				continue
+			}
+			if !strings.HasSuffix(strings.ToLower(parsed.Hostname()), ".onion") && parsed.Scheme != "https" {
+				return fmt.Errorf("privacyStrict requires HTTPS or .onion for %s", name)
+			}
+		}
+	}
+	return nil
+}
+
+func isLoopbackEndpoint(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip, err := netip.ParseAddr(host)
+	return err == nil && ip.IsLoopback()
+}
+
+func newPrivacyHTTPClient(cfg Config) (*http.Client, error) {
+	if err := validatePrivacyConfig(cfg); err != nil {
+		return nil, err
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	if cfg.TorSOCKS5Proxy != "" {
+		u, _ := url.Parse(cfg.TorSOCKS5Proxy)
+		dialer, err := xproxy.SOCKS5("tcp", u.Host, nil, xproxy.Direct)
+		if err != nil {
+			return nil, err
+		}
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			if isLoopbackEndpoint(host) {
+				return (&net.Dialer{}).DialContext(ctx, network, address)
+			}
+			result := make(chan struct {
+				conn net.Conn
+				err  error
+			}, 1)
+			go func() {
+				conn, err := dialer.Dial(network, address)
+				result <- struct {
+					conn net.Conn
+					err  error
+				}{conn, err}
+			}()
+			select {
+			case r := <-result:
+				return r.conn, r.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return &http.Client{Transport: transport, Timeout: time.Duration(cfg.RPCTimeoutSeconds) * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, nil
+}
+
 func NewPool(cfg Config) *Pool {
+	httpClient, err := newPrivacyHTTPClient(cfg)
+	if err != nil {
+		panic(err)
+	}
 	pool := &Pool{
 		cfg:               cfg,
-		rpc:               &RPCClient{endpoint: cfg.NodeRPC, method: strings.ToLower(cfg.WorkMethod), client: &http.Client{Timeout: time.Duration(cfg.RPCTimeoutSeconds) * time.Second}},
+		rpc:               &RPCClient{endpoint: cfg.NodeRPC, method: strings.ToLower(cfg.WorkMethod), client: httpClient},
 		miners:            make(map[string]*Miner),
 		balances:          make(map[string]float64),
 		recipientViewKeys: make(map[string]string),
@@ -1956,8 +2050,8 @@ func (p *Pool) writeStatus(w http.ResponseWriter) {
 		"miners":             miners,
 		"balances":           balances,
 		"pendingBalances":    pendingBalances,
-		"payments":           payments,
-		"network":            network,
+		"payments":           publicPayments(payments),
+		"network":            publicNetworkStatus(network),
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -2020,12 +2114,12 @@ func (p *Pool) writeUserStatus(w http.ResponseWriter, r *http.Request) {
 		"rejectedShares":      rejected,
 		"roundShares":         roundShares,
 		"workers":             miners,
-		"payments":            payments,
+		"payments":            publicPayments(payments),
 		"explorerURL":         p.cfg.ExplorerURL,
 		"work":                work,
 		"minPayoutAntd":       p.cfg.MinPayoutAntd,
 		"maxPayoutPerTxAntd":  p.cfg.MaxPayoutPerTxAntd,
-		"network":             network,
+		"network":             publicNetworkStatus(network),
 	}
 	w.Header().Set("content-type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -3135,4 +3229,28 @@ func randomXMeetsTarget(raw, target string) bool {
 		b[i], b[j] = b[j], b[i]
 	}
 	return digestMeetsTarget(hex.EncodeToString(b), target)
+}
+
+// Public responses expose payment progress, never internal payout diagnostics.
+func publicPayments(payments []Payment) []Payment {
+	out := append([]Payment{}, payments...)
+	for i := range out {
+		state := strings.SplitN(out[i].Status, ":", 2)[0]
+		switch state {
+		case "sent", "confirmed", "unconfirmed", "pending", "waiting", "failed":
+			out[i].Status = state
+		default:
+			out[i].Status = "waiting"
+		}
+		out[i].RecipientViewKey = ""
+	}
+	return out
+}
+func publicNetworkStatus(status NetworkStatus) NetworkStatus {
+	status.HeadError = ""
+	status.PrivacyCommitmentError = ""
+	status.PoolWalletAlgorithmError = ""
+	status.ShieldedPayoutProverError = ""
+	status.PayoutBlockedReason = ""
+	return status
 }
