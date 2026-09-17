@@ -67,6 +67,7 @@ type Config struct {
 	ShieldedPayoutApplication string  `json:"shieldedPayoutApplication"`
 	TorSOCKS5Proxy            string  `json:"torSocks5Proxy"`
 	PrivacyStrict             bool    `json:"privacyStrict"`
+	OnionOnly                 bool    `json:"onionOnly"`
 }
 
 type PayoutState struct {
@@ -256,8 +257,33 @@ func loadConfig(path string) (Config, error) {
 			cfg.ListenHTTP = "0.0.0.0:33230"
 		}
 	}
+	if cfg.OnionOnly {
+		if cfg.ListenHTTP != "" {
+			bound, err := bindLoopback(cfg.ListenHTTP)
+			if err != nil {
+				return cfg, fmt.Errorf("onionOnly requires a host:port HTTP listener: %w", err)
+			}
+			cfg.ListenHTTP = bound
+		}
+		if cfg.ListenStratum != "" {
+			bound, err := bindLoopback(cfg.ListenStratum)
+			if err != nil {
+				return cfg, fmt.Errorf("onionOnly requires a host:port stratum listener: %w", err)
+			}
+			cfg.ListenStratum = bound
+		}
+		if cfg.PublicStratum != "" {
+			host, _, err := net.SplitHostPort(cfg.PublicStratum)
+			if err != nil || (!isLoopbackEndpoint(host) && !strings.HasSuffix(strings.ToLower(strings.TrimSuffix(host, ".")), ".onion")) {
+				return cfg, errors.New("onionOnly requires a loopback or .onion public stratum endpoint")
+			}
+		}
+	}
 	if cfg.PublicURL == "" {
 		cfg.PublicURL = "http://" + cfg.ListenHTTP
+	}
+	if cfg.OnionOnly && !onionOrLoopbackURL(cfg.PublicURL) {
+		return cfg, errors.New("onionOnly requires a loopback or .onion publicURL")
 	}
 	cfg.PublicURL = strings.TrimRight(cfg.PublicURL, "/")
 	cfg.ExplorerURL = strings.TrimRight(cfg.ExplorerURL, "/")
@@ -314,10 +340,27 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
+func bindLoopback(addr string) (string, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort("127.0.0.1", port), nil
+}
+
+func onionOrLoopbackURL(value string) bool {
+	u, err := url.Parse(value)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(u.Hostname(), "."))
+	return isLoopbackEndpoint(host) || strings.HasSuffix(host, ".onion")
+}
+
 func validatePrivacyConfig(cfg Config) error {
 	if cfg.TorSOCKS5Proxy == "" {
-		if cfg.PrivacyStrict {
-			return errors.New("privacyStrict requires torSocks5Proxy")
+		if cfg.PrivacyStrict || cfg.OnionOnly {
+			return errors.New("privacyStrict/onionOnly requires torSocks5Proxy")
 		}
 		return nil
 	}
@@ -325,7 +368,7 @@ func validatePrivacyConfig(cfg Config) error {
 	if err != nil || u.Scheme != "socks5" || u.Hostname() == "" || u.Port() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return errors.New("torSocks5Proxy must be a plain socks5://host:port URL")
 	}
-	if cfg.PrivacyStrict {
+	if cfg.PrivacyStrict || cfg.OnionOnly {
 		for name, endpoint := range map[string]string{"nodeRPC": cfg.NodeRPC, "prover": cfg.ShieldedPayoutProverURL} {
 			if endpoint == "" {
 				continue
@@ -337,7 +380,11 @@ func validatePrivacyConfig(cfg Config) error {
 			if isLoopbackEndpoint(parsed.Hostname()) {
 				continue
 			}
-			if !strings.HasSuffix(strings.ToLower(parsed.Hostname()), ".onion") && parsed.Scheme != "https" {
+			onion := strings.HasSuffix(strings.ToLower(strings.TrimSuffix(parsed.Hostname(), ".")), ".onion")
+			if cfg.OnionOnly && !onion {
+				return fmt.Errorf("onionOnly requires a .onion endpoint for %s (loopback is allowed)", name)
+			}
+			if !cfg.OnionOnly && !onion && parsed.Scheme != "https" {
 				return fmt.Errorf("privacyStrict requires HTTPS or .onion for %s", name)
 			}
 		}

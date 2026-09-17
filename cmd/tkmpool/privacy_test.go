@@ -23,3 +23,14 @@ func TestPrivacyConfigAllowsLocalDaemonAndSecureRemoteProver(t *testing.T) {
 		t.Fatalf("privacy HTTP client unavailable: %v", err)
 	}
 }
+
+func TestOnionOnlyRejectsClearnetEndpoints(t *testing.T) {
+	cfg := Config{OnionOnly: true, TorSOCKS5Proxy: "socks5://127.0.0.1:9050", NodeRPC: "https://node.example/rpc"}
+	if err := validatePrivacyConfig(cfg); err == nil {
+		t.Fatal("onion-only mode accepted a clearnet node RPC")
+	}
+	cfg.NodeRPC = "http://127.0.0.1:8545"
+	if err := validatePrivacyConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+}

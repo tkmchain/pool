@@ -33,5 +33,6 @@
   "explorerURL": "https://block.tkmchain.site",
   "publicStratum": "127.0.0.1:33330",
   "torSocks5Proxy": "",
-  "privacyStrict": false
+  "privacyStrict": false,
+  "onionOnly": false
 }
