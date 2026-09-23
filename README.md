@@ -12,6 +12,12 @@ It provides:
 - Optional guarded payout submission through the node RPC.
 - Built-in HTML dashboard.
 
+### Dashboard translation
+
+The dashboard, miner lookup, and admin pages include an offline language picker. It is embedded in the pool response, so it works without a CDN or an external translation service and is available in onion-only deployments. The picker remembers the selected language in the browser and translates labels, table headings, statuses, pagination text, and dynamically refreshed rows. Wallet addresses, transaction hashes, worker names, and diagnostic messages remain unchanged so operational details can still be copied exactly.
+
+The bundled language list includes Chinese, Russian, English, Japanese, Korean, Spanish, French, German, Portuguese, Arabic, Hindi, Italian, Turkish, Vietnamese, Thai, Indonesian, Polish, Dutch, Ukrainian, and Swahili. Languages without a complete phrase override use the English source text for any phrase that has not been localized.
+
 ## Run
 
 ```sh
