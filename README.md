@@ -132,6 +132,25 @@ shielded payout prover has no spendable shielded notes
 
 That means the prover service and proving key can be healthy while payout liquidity is still missing. Fund the prover by importing real shielded notes with known on-chain commitments and Merkle witnesses; do not create synthetic local notes.
 
+## Antartical protocol status
+
+The pool reads the daemon's read-only `tkmprotocol_antarticalStatus` and
+`tkmprotocol_antarticalFeatures` methods and exposes the result in `/api/status`
+and `/api/admin/status`. This keeps mining and payout operations aligned with
+the canonical chain head instead of a local clock. The admin view shows the
+validator parameters used by the consensus implementation: a 500,000 TKM bond,
+a 100 TKM registration burn, a 720-block activation queue, a 21,600-block
+unbonding period, and a halving-aware 70 TKM selected-validator reward.
+
+The dashboard labels Shield3/Shield4 privacy and post-quantum mode separately
+from Antartical activation. It also shows which catalog entries are consensus
+ready. Slot-level read/write witnesses are available for deterministic
+optimistic transfers; contract calls remain serial. Parallel contract
+execution, enforced stateless Verkle sync, bundled Revm/evmone adapters, and
+native byte-compatible EIP-4337/RIP-7560 execution remain gated until the
+daemon reports them ready. A missing protocol namespace is displayed as
+unavailable and never treated as an empty validator set.
+
 For pool-owned liquidity, use the prover's authenticated deposit endpoint instead of sending TKM to mainking:
 
 ```sh

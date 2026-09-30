@@ -109,26 +109,42 @@ type RPCHeader struct {
 }
 
 type NetworkStatus struct {
-	LatestBlock                    uint64 `json:"latestBlock"`
-	LatestTimestamp                uint64 `json:"latestTimestamp"`
-	HeadError                      string `json:"headError,omitempty"`
-	PrivacyCommitmentTime          uint64 `json:"privacyCommitmentTime"`
-	PrivacyCommitmentActive        bool   `json:"privacyCommitmentActive"`
-	PrivacyCommitmentSource        string `json:"privacyCommitmentSource"`
-	PrivacyCommitmentError         string `json:"privacyCommitmentError,omitempty"`
-	QuantumResistantTime           uint64 `json:"quantumResistantTime"`
-	QuantumResistantActive         bool   `json:"quantumResistantActive"`
-	PoolWalletAlgorithm            string `json:"poolWalletAlgorithm,omitempty"`
-	PoolWalletAlgorithmError       string `json:"poolWalletAlgorithmError,omitempty"`
-	ShieldedPayoutProverConfigured bool   `json:"shieldedPayoutProverConfigured"`
-	ShieldedPayoutsEnabled         bool   `json:"shieldedPayoutsEnabled"`
-	ShieldedPayoutProverReady      bool   `json:"shieldedPayoutProverReady"`
-	ShieldedPayoutProverError      string `json:"shieldedPayoutProverError,omitempty"`
-	ShieldedPayoutAvailableNotes   int    `json:"shieldedPayoutAvailableNotes"`
-	ShieldedPayoutMaxNoteWei       string `json:"shieldedPayoutMaxNoteWei,omitempty"`
-	PayoutTxType                   string `json:"payoutTxType"`
-	PayoutReady                    bool   `json:"payoutReady"`
-	PayoutBlockedReason            string `json:"payoutBlockedReason,omitempty"`
+	LatestBlock                    uint64            `json:"latestBlock"`
+	LatestTimestamp                uint64            `json:"latestTimestamp"`
+	HeadError                      string            `json:"headError,omitempty"`
+	PrivacyCommitmentTime          uint64            `json:"privacyCommitmentTime"`
+	PrivacyCommitmentActive        bool              `json:"privacyCommitmentActive"`
+	PrivacyCommitmentSource        string            `json:"privacyCommitmentSource"`
+	PrivacyCommitmentError         string            `json:"privacyCommitmentError,omitempty"`
+	QuantumResistantTime           uint64            `json:"quantumResistantTime"`
+	QuantumResistantActive         bool              `json:"quantumResistantActive"`
+	PoolWalletAlgorithm            string            `json:"poolWalletAlgorithm,omitempty"`
+	PoolWalletAlgorithmError       string            `json:"poolWalletAlgorithmError,omitempty"`
+	ShieldedPayoutProverConfigured bool              `json:"shieldedPayoutProverConfigured"`
+	ShieldedPayoutsEnabled         bool              `json:"shieldedPayoutsEnabled"`
+	ShieldedPayoutProverReady      bool              `json:"shieldedPayoutProverReady"`
+	ShieldedPayoutProverError      string            `json:"shieldedPayoutProverError,omitempty"`
+	ShieldedPayoutAvailableNotes   int               `json:"shieldedPayoutAvailableNotes"`
+	ShieldedPayoutMaxNoteWei       string            `json:"shieldedPayoutMaxNoteWei,omitempty"`
+	PayoutTxType                   string            `json:"payoutTxType"`
+	PayoutReady                    bool              `json:"payoutReady"`
+	PayoutBlockedReason            string            `json:"payoutBlockedReason,omitempty"`
+	AntarticalActive               bool              `json:"antarticalActive"`
+	AntarticalActivationTime       uint64            `json:"antarticalActivationTime,omitempty"`
+	AntarticalHead                 uint64            `json:"antarticalHead,omitempty"`
+	AntarticalFeatureError         string            `json:"antarticalFeatureError,omitempty"`
+	AntarticalFeatures             []ProtocolFeature `json:"antarticalFeatures,omitempty"`
+}
+
+// ProtocolFeature mirrors the read-only tkmprotocol feature catalog. A
+// feature may be active at the fork while still gated from consensus until
+// its implementation is complete.
+type ProtocolFeature struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	ActivationTime  uint64 `json:"activationTime,omitempty"`
+	ConsensusReady  bool   `json:"consensusReady"`
+	ImplementedArea string `json:"implementedArea,omitempty"`
 }
 
 const (
@@ -1889,6 +1905,14 @@ func (p *Pool) networkStatus(ctx context.Context) NetworkStatus {
 		ShieldedPayoutProverConfigured: p.shieldedPayoutProverConfigured(),
 		PayoutReady:                    true,
 	}
+	if active, activation, head, features, err := p.rpc.AntarticalProtocol(ctx); err != nil {
+		status.AntarticalFeatureError = err.Error()
+	} else {
+		status.AntarticalActive = active
+		status.AntarticalActivationTime = activation
+		status.AntarticalHead = head
+		status.AntarticalFeatures = features
+	}
 
 	if header, err := p.rpc.LatestHeader(ctx); err != nil {
 		status.HeadError = err.Error()
@@ -2533,6 +2557,43 @@ func (r *RPCClient) PrivacyCommitmentActive(ctx context.Context) (bool, error) {
 	return active, nil
 }
 
+func rpcUintAny(value any) uint64 {
+	switch v := value.(type) {
+	case string:
+		return parseUintFlexible(v)
+	case float64:
+		if v >= 0 {
+			return uint64(v)
+		}
+	case json.Number:
+		return parseUintFlexible(v.String())
+	case uint64:
+		return v
+	case int:
+		if v >= 0 {
+			return uint64(v)
+		}
+	}
+	return 0
+}
+
+func (r *RPCClient) AntarticalProtocol(ctx context.Context) (bool, uint64, uint64, []ProtocolFeature, error) {
+	var status map[string]any
+	if err := r.call(ctx, "tkmprotocol_antarticalStatus", []any{}, &status); err != nil {
+		return false, 0, 0, nil, err
+	}
+	var features []ProtocolFeature
+	if err := r.call(ctx, "tkmprotocol_antarticalFeatures", []any{}, &features); err != nil {
+		return false, 0, 0, nil, err
+	}
+	return boolValue(status["active"]), rpcUintAny(status["activationTime"]), rpcUintAny(status["headNumber"]), features, nil
+}
+
+func boolValue(value any) bool {
+	b, ok := value.(bool)
+	return ok && b
+}
+
 func (r *RPCClient) AccountAlgorithm(ctx context.Context, address string) (string, error) {
 	address = normalizeAddress(address)
 	if !isValidAddress(address) {
@@ -3094,6 +3155,7 @@ const indexHTML = `<!doctype html>
     function txLink(hash) { return hash && explorerURL ? '<a href="' + explorerURL + '/tx/' + hash + '" target="_blank" rel="noopener">' + hash + '</a>' : (hash || '-'); }
     function networkText(n) {
       const parts = [];
+      if (n && n.antarticalActive) parts.push('Antartical');
       if (n && n.quantumResistantActive) parts.push('PQ');
       if (n && n.privacyCommitmentActive) parts.push('Privacy');
       return parts.length ? parts.join(' + ') : 'Legacy';
@@ -3228,6 +3290,7 @@ const userHTML = `<!doctype html>
     function txLink(hash) { return hash && explorerURL ? '<a href="' + explorerURL + '/tx/' + hash + '" target="_blank" rel="noopener">' + hash + '</a>' : (hash || '-'); }
     function networkText(n) {
       const parts = [];
+      if (n && n.antarticalActive) parts.push('Antartical');
       if (n && n.quantumResistantActive) parts.push('PQ');
       if (n && n.privacyCommitmentActive) parts.push('Privacy');
       return parts.length ? parts.join(' + ') : 'Legacy';
@@ -3359,6 +3422,13 @@ const adminHTML = `<!doctype html>
     </section>
 
     <section class="section panel">
+      <h2>Antartical protocol</h2>
+      <p class="muted">Read-only consensus status from <code>tkmprotocol</code>. Gated features are not enabled by a pool setting.</p>
+      <table><tbody id="protocolRows"></tbody></table>
+      <div id="protocolFeatures" class="muted" style="margin-top:12px"></div>
+    </section>
+
+    <section class="section panel">
       <h2>Miner Balances</h2>
       <table><thead><tr><th>Wallet</th><th>Confirmed TKM</th><th>Pending Round TKM</th><th>Total TKM</th></tr></thead><tbody id="balances"></tbody></table>
     </section>
@@ -3388,6 +3458,7 @@ const adminHTML = `<!doctype html>
     function errText(v) { return v ? '<span class="bad">' + String(v) + '</span>' : ''; }
     function networkText(n) {
       const parts = [];
+      if (n && n.antarticalActive) parts.push('Antartical');
       if (n && n.quantumResistantActive) parts.push('PQ');
       if (n && n.privacyCommitmentActive) parts.push('Privacy');
       return parts.length ? parts.join(' + ') : 'Legacy';
@@ -3426,6 +3497,9 @@ const adminHTML = `<!doctype html>
       $('walletRows').innerHTML = kv('Pool wallet', s.poolWallet) + kv('Payout status', payoutStatus) + kv('Latest balance', b.latestError ? errText(b.latestError) : money(b.latestAntd)) + kv('Confirmed balance', b.confirmedError ? errText(b.confirmedError) : money(b.confirmedAntd)) + kv('Pending balance', b.pendingError ? errText(b.pendingError) : (b.pendingAntd !== undefined ? money(b.pendingAntd) : '-')) + kv('Usable balance', b.availableAntd !== undefined ? money(b.availableAntd) : '-') + kv('Reserve', money(s.payoutReserveAntd)) + kv('Spendable', b.confirmedError ? errText(b.confirmedError) : money(b.spendableAntd)) + kv('Total miner balance owed', b.totalOwedAntd !== undefined ? money(b.totalOwedAntd) : money(s.totalConfirmedMinerBalanceAntd)) + kv('Estimated next tx fee', b.estimatedTxFeeAntd !== undefined ? money(b.estimatedTxFeeAntd) : (b.feeEstimateError ? errText(b.feeEstimateError) : '-')) + kv('Spendable after next fee', b.spendableAfterFeeAntd !== undefined ? money(b.spendableAfterFeeAntd) : '-') + kv('Next payout', b.nextPayoutAntd !== undefined ? money(b.nextPayoutAntd) + ' to ' + b.nextPayoutWallet : '-') + kv('Payout tx type', n.payoutTxType || 'default') + kv('Pool wallet algorithm', n.poolWalletAlgorithm || (n.poolWalletAlgorithmError ? errText(n.poolWalletAlgorithmError) : '-')) + kv('Quantum active', yesno(n.quantumResistantActive)) + kv('Privacy commitments active', yesno(n.privacyCommitmentActive)) + kv('Shielded prover configured', yesno(n.shieldedPayoutProverConfigured)) + kv('Shielded payouts enabled', yesno(n.shieldedPayoutsEnabled)) + kv('Payout gate', n.payoutReady ? '<span class="ok">ready</span>' : '<span class="warn">' + (n.payoutBlockedReason || 'blocked') + '</span>') + kv('Password configured', yesno(s.poolWalletPasswordConfigured)) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Rewards go to pool wallet', yesno(s.poolWalletIsDaemonCoinbase));
       $('runtimeRows').innerHTML = kv('Public URL', s.publicURL) + kv('HTTP bind', s.http) + kv('Stratum public', s.stratum) + kv('Stratum bind', s.stratumBind) + kv('Explorer', s.explorerURL || '-') + kv('Node RPC', s.nodeRPC) + kv('Work method', s.workMethod) + kv('Daemon coinbase', s.daemonCoinbaseError ? errText(s.daemonCoinbaseError) : s.daemonCoinbase) + kv('Current height', (s.work && s.work.height) || 0) + kv('Total shares', s.totalShares) + kv('Workers', s.workerCount) + kv('Connected miners', s.authorizedSessions ?? s.connectedSessions ?? 0) + kv('Uptime seconds', s.uptimeSeconds) + kv('Redis', (s.redis && s.redis.addr) + ' db ' + (s.redis && s.redis.db) + ' key ' + (s.redis && s.redis.stateKey));
       $('payoutRows').innerHTML = kv('Auto pay', yesno(s.autoPay)) + kv('Payment mode', s.paymentMode) + kv('Block reward', money(s.blockRewardAntd)) + kv('Pool fee', s.feePercent + '%') + kv('Minimum payout', money(s.minPayoutAntd)) + kv('Configured maximum per tx', money(s.maxPayoutPerTxAntd)) + kv('Effective maximum per tx', money(s.effectiveMaxPayoutPerTxAntd || s.maxPayoutPerTxAntd)) + kv('Payment interval', s.paymentIntervalSeconds + ' seconds') + kv('Work poll interval', s.workPollIntervalMs + ' ms') + kv('Confirmations for scheduled pay', s.paymentConfirmations) + kv('Shielded payout prover', yesno(n.shieldedPayoutProverConfigured)) + kv('Shielded payout mode', yesno(n.shieldedPayoutsEnabled)) + kv('Privacy commitment time', n.privacyCommitmentTime ? new Date(Number(n.privacyCommitmentTime) * 1000).toISOString() : '-') + kv('Quantum-resistant time', n.quantumResistantTime ? new Date(Number(n.quantumResistantTime) * 1000).toISOString() : '-') + kv('Recent payment records', s.paymentCount);
+      $('protocolRows').innerHTML = kv('Antartical active', yesno(n.antarticalActive)) + kv('Activation time', n.antarticalActivationTime ? new Date(Number(n.antarticalActivationTime) * 1000).toISOString() : '-') + kv('Protocol head', n.antarticalHead || '-') + kv('Validator bond', '500000 TKM') + kv('Validator registration burn', '100 TKM') + kv('Validator reward', '70 TKM per selected validator, halving-aware');
+      const features = Array.isArray(n.antarticalFeatures) ? n.antarticalFeatures : [];
+      $('protocolFeatures').innerHTML = features.length ? '<strong>Feature gates</strong><ul>' + features.map(f => '<li><code>' + String(f.id || '') + '</code> ' + String(f.name || '') + ' — ' + (f.consensusReady ? '<span class="ok">ready</span>' : '<span class="warn">gated</span>') + '</li>').join('') + '</ul>' : (n.antarticalFeatureError ? '<span class="warn">protocol catalog unavailable: ' + String(n.antarticalFeatureError) + '</span>' : 'No feature catalog returned by the daemon.');
       const wallets = Array.from(new Set([...Object.keys(s.balances || {}), ...Object.keys(s.pendingBalances || {})]));
       $('balances').innerHTML = wallets.map(w => {
         const confirmed = (s.balances || {})[w] || 0;
@@ -3490,6 +3564,7 @@ func publicNetworkStatus(status NetworkStatus) NetworkStatus {
 	status.PrivacyCommitmentError = ""
 	status.PoolWalletAlgorithmError = ""
 	status.ShieldedPayoutProverError = ""
+	status.AntarticalFeatureError = ""
 	status.PayoutBlockedReason = ""
 	return status
 }
