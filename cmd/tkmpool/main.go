@@ -75,6 +75,7 @@ type PayoutState struct {
 	Payments          []Payment          `json:"payments"`
 	Miners            map[string]Miner   `json:"miners"`
 	RecipientViewKeys map[string]string  `json:"recipientViewKeys,omitempty"`
+	RecipientCodes    map[string]string  `json:"recipientCodes,omitempty"`
 	TotalShares       uint64             `json:"totalShares"`
 }
 
@@ -101,6 +102,7 @@ type Payment struct {
 	TxHash           string    `json:"txHash,omitempty"`
 	CreatedAt        time.Time `json:"createdAt"`
 	RecipientViewKey string    `json:"recipientViewKey,omitempty"`
+	RecipientCode    string    `json:"recipientCode,omitempty"`
 }
 
 type RPCHeader struct {
@@ -166,6 +168,7 @@ type Pool struct {
 	jobs              map[string]Work
 	sessions          map[*stratumSession]struct{}
 	recipientViewKeys map[string]string
+	recipientCodes    map[string]string
 	logMu             sync.Mutex
 	lastLog           map[string]logThrottle
 	started           time.Time
@@ -469,6 +472,7 @@ func NewPool(cfg Config) *Pool {
 		miners:            make(map[string]*Miner),
 		balances:          make(map[string]float64),
 		recipientViewKeys: make(map[string]string),
+		recipientCodes:    make(map[string]string),
 		jobs:              make(map[string]Work),
 		sessions:          make(map[*stratumSession]struct{}),
 		lastLog:           make(map[string]logThrottle),
@@ -556,6 +560,16 @@ func (p *Pool) applyPayoutStateLocked(state PayoutState) {
 			}
 		}
 	}
+	if state.RecipientCodes != nil {
+		p.recipientCodes = make(map[string]string, len(state.RecipientCodes))
+		for wallet, code := range state.RecipientCodes {
+			wallet = normalizeAddress(wallet)
+			code = strings.TrimSpace(code)
+			if isValidAddress(wallet) && strings.HasPrefix(strings.ToLower(code), "tkmshield3.") {
+				p.recipientCodes[wallet] = code
+			}
+		}
+	}
 	if state.TotalShares > 0 {
 		p.shares.Store(state.TotalShares)
 	}
@@ -599,6 +613,7 @@ func (p *Pool) savePayoutStateLocked() {
 		Payments:          append([]Payment{}, p.payments...),
 		Miners:            make(map[string]Miner, len(p.miners)),
 		RecipientViewKeys: make(map[string]string, len(p.recipientViewKeys)),
+		RecipientCodes:    make(map[string]string, len(p.recipientCodes)),
 		TotalShares:       p.shares.Load(),
 	}
 	for wallet, balance := range p.balances {
@@ -611,6 +626,9 @@ func (p *Pool) savePayoutStateLocked() {
 	}
 	for wallet, key := range p.recipientViewKeys {
 		state.RecipientViewKeys[wallet] = key
+	}
+	for wallet, code := range p.recipientCodes {
+		state.RecipientCodes[wallet] = code
 	}
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -971,6 +989,9 @@ func parseMinerLogin(user string) (string, string) {
 func parseMinerLoginRecipient(user string) (string, string, string) {
 	user = strings.TrimSpace(user)
 	if recipient, err := parseShieldedPaymentCode(user); err == nil {
+		if recipient.Code != "" {
+			return recipient.Address, "", recipient.Code
+		}
 		return recipient.Address, "", recipient.ViewKey
 	}
 	separator := strings.LastIndex(user, ".")
@@ -978,6 +999,9 @@ func parseMinerLoginRecipient(user string) (string, string, string) {
 	if separator > 0 {
 		walletText, worker = user[:separator], strings.TrimSpace(user[separator+1:])
 		if recipient, err := parseShieldedPaymentCode(walletText); err == nil {
+			if recipient.Code != "" {
+				return recipient.Address, worker, recipient.Code
+			}
 			return recipient.Address, worker, recipient.ViewKey
 		}
 	}
@@ -1008,6 +1032,8 @@ func (p *Pool) touchMiner(wallet, worker, viewKey string) {
 	m.LastSeen = time.Now()
 	if isValidViewKey(viewKey) {
 		p.recipientViewKeys[wallet] = strings.ToLower(strings.TrimPrefix(viewKey, "0x"))
+	} else if strings.HasPrefix(strings.ToLower(strings.TrimSpace(viewKey)), "tkmshield3.") {
+		p.recipientCodes[wallet] = strings.TrimSpace(viewKey)
 	}
 	p.savePayoutStateLocked()
 }
@@ -1260,6 +1286,95 @@ type shieldedPaymentCode struct {
 type shieldedRecipient struct {
 	Address string
 	ViewKey string
+	Code    string
+}
+
+type paymentRLPNode struct {
+	list     bool
+	bytes    []byte
+	children []paymentRLPNode
+}
+
+func decodePaymentRLP(data []byte) (paymentRLPNode, int, error) {
+	if len(data) == 0 {
+		return paymentRLPNode{}, 0, errors.New("empty RLP")
+	}
+	prefix := data[0]
+	readLength := func(offset, length int) (int, error) {
+		if length <= 0 || length > 8 || offset+length > len(data) {
+			return 0, errors.New("invalid RLP length")
+		}
+		var n uint64
+		for _, b := range data[offset : offset+length] {
+			if n > (^(uint64(0)) >> 8) {
+				return 0, errors.New("RLP length overflow")
+			}
+			n = (n << 8) | uint64(b)
+		}
+		if n > uint64(len(data)) || n > uint64(^uint(0)>>1) {
+			return 0, errors.New("RLP length out of range")
+		}
+		return int(n), nil
+	}
+	if prefix <= 0x7f {
+		return paymentRLPNode{bytes: append([]byte(nil), prefix)}, 1, nil
+	}
+	if prefix <= 0xb7 {
+		length := int(prefix - 0x80)
+		if 1+length > len(data) {
+			return paymentRLPNode{}, 0, errors.New("truncated RLP string")
+		}
+		return paymentRLPNode{bytes: append([]byte(nil), data[1:1+length]...)}, 1 + length, nil
+	}
+	if prefix <= 0xbf {
+		length, err := readLength(1, int(prefix-0xb7))
+		if err != nil || 1+int(prefix-0xb7)+length > len(data) {
+			return paymentRLPNode{}, 0, errors.New("invalid long RLP string")
+		}
+		offset := 1 + int(prefix-0xb7)
+		return paymentRLPNode{bytes: append([]byte(nil), data[offset:offset+length]...)}, offset + length, nil
+	}
+	var payloadLen int
+	var offset int
+	if prefix <= 0xf7 {
+		payloadLen = int(prefix - 0xc0)
+		offset = 1
+	} else {
+		length, err := readLength(1, int(prefix-0xf7))
+		if err != nil {
+			return paymentRLPNode{}, 0, errors.New("invalid long RLP list")
+		}
+		payloadLen = length
+		offset = 1 + int(prefix-0xf7)
+	}
+	if offset+payloadLen > len(data) {
+		return paymentRLPNode{}, 0, errors.New("truncated RLP list")
+	}
+	end := offset + payloadLen
+	node := paymentRLPNode{list: true}
+	for offset < end {
+		child, used, err := decodePaymentRLP(data[offset:end])
+		if err != nil || used <= 0 {
+			return paymentRLPNode{}, 0, errors.New("invalid RLP list item")
+		}
+		node.children = append(node.children, child)
+		offset += used
+	}
+	if offset != end {
+		return paymentRLPNode{}, 0, errors.New("RLP list boundary mismatch")
+	}
+	return node, end, nil
+}
+
+func paymentRLPUint(node paymentRLPNode) (uint64, bool) {
+	if node.list || len(node.bytes) > 8 {
+		return 0, false
+	}
+	var value uint64
+	for _, b := range node.bytes {
+		value = (value << 8) | uint64(b)
+	}
+	return value, true
 }
 
 // parseShieldedPaymentCode accepts the public tkmshield2 code produced by
@@ -1267,8 +1382,31 @@ type shieldedRecipient struct {
 // a spending key.
 func parseShieldedPaymentCode(code string) (shieldedRecipient, error) {
 	code = strings.TrimSpace(code)
+	lower := strings.ToLower(code)
+	const prefix3 = "tkmshield3."
+	if strings.HasPrefix(lower, prefix3) {
+		if len(code) > 65536 {
+			return shieldedRecipient{}, errors.New("Shield3 payment code is too long")
+		}
+		payload, err := base64.RawURLEncoding.Strict().DecodeString(code[len(prefix3):])
+		if err != nil {
+			return shieldedRecipient{}, errors.New("invalid Shield3 payment code")
+		}
+		node, used, err := decodePaymentRLP(payload)
+		if err != nil || used != len(payload) || !node.list || len(node.children) < 1 || !node.children[0].list || len(node.children[0].children) < 3 {
+			return shieldedRecipient{}, errors.New("invalid Shield3 payment code payload")
+		}
+		p := node.children[0].children
+		version, vok := paymentRLPUint(p[0])
+		chainID, cok := paymentRLPUint(p[1])
+		if !vok || !cok || version != 3 || chainID != shieldedPaymentChainID || p[2].list || len(p[2].bytes) != 20 {
+			return shieldedRecipient{}, errors.New("Shield3 payment code is not for TKM mainnet")
+		}
+		address := "0x" + hex.EncodeToString(p[2].bytes)
+		return shieldedRecipient{Address: address, Code: code}, nil
+	}
 	const prefix = "tkmshield2."
-	if !strings.HasPrefix(strings.ToLower(code), prefix) {
+	if !strings.HasPrefix(lower, prefix) {
 		return shieldedRecipient{}, errors.New("not a Shield2 payment code")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(code[len(prefix):])
@@ -1391,6 +1529,7 @@ type ShieldedPayoutRequest struct {
 	AmountWei             string    `json:"amountWei"`
 	PayoutTxType          string    `json:"payoutTxType,omitempty"`
 	RecipientViewKey      string    `json:"recipientViewKey"`
+	RecipientCode         string    `json:"recipientCode,omitempty"`
 	ChangeViewKey         string    `json:"changeViewKey"`
 	PrivacyCommitmentTime uint64    `json:"privacyCommitmentTime"`
 	QuantumResistantTime  uint64    `json:"quantumResistantTime"`
@@ -1570,7 +1709,8 @@ func (p *Pool) createShieldedLiquidityNote(ctx context.Context, amount float64) 
 	}
 	amount = minFloat(round(amount), shieldedMaxPayoutPerTxAntd)
 	wei := antdToWeiInt(amount)
-	body, err := json.Marshal(map[string]any{"requestId": fmt.Sprintf("pool-liquidity-%d", time.Now().UnixNano()), "amountAntd": amount, "amountWei": "0x" + wei.Text(16), "from": normalizeAddress(p.cfg.PoolWallet), "to": normalizeAddress(p.cfg.PoolWallet), "recipientViewKey": "0x" + change.ViewKey, "createdAt": time.Now().UTC()})
+	liquidityRequestID := fmt.Sprintf("pool-liquidity-%d", time.Now().UnixNano())
+	body, err := json.Marshal(map[string]any{"requestId": liquidityRequestID, "applicationData": "0x" + hex.EncodeToString([]byte("TKM_POOL_LIQUIDITY:"+liquidityRequestID)), "amountAntd": amount, "amountWei": "0x" + wei.Text(16), "from": normalizeAddress(p.cfg.PoolWallet), "to": normalizeAddress(p.cfg.PoolWallet), "recipientViewKey": "0x" + change.ViewKey, "createdAt": time.Now().UTC()})
 	if err != nil {
 		return err
 	}
@@ -1625,12 +1765,15 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 	if !isValidAddress(to) {
 		return "", fmt.Errorf("invalid shielded payout address %q", payment.Wallet)
 	}
-	if !isValidViewKey(payment.RecipientViewKey) {
-		return "", fmt.Errorf("miner %s must reconnect with a tkmshield2 payment code before receiving shielded payouts", to)
-	}
-	change, err := p.shieldedPayoutChangeRecipient()
-	if err != nil {
-		return "", err
+	var change shieldedRecipient
+	if strings.TrimSpace(payment.RecipientCode) == "" {
+		if !isValidViewKey(payment.RecipientViewKey) {
+			return "", fmt.Errorf("miner %s must reconnect with a full tkmshield3 payment code before receiving Shield4 payouts", to)
+		}
+		change, err = p.shieldedPayoutChangeRecipient()
+		if err != nil {
+			return "", err
+		}
 	}
 	payment.Amount = effectiveShieldedPayoutAmount(payment.Amount)
 	if payment.Amount <= 0 {
@@ -1640,6 +1783,12 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 	if amountWei.Sign() <= 0 || amountWei.BitLen() > 64 {
 		return "", fmt.Errorf("shielded payout amount %.8f exceeds uint64 wei circuit limit", payment.Amount)
 	}
+	recipientViewKey := ""
+	changeViewKey := ""
+	if payment.RecipientCode == "" {
+		recipientViewKey = "0x" + strings.ToLower(strings.TrimPrefix(payment.RecipientViewKey, "0x"))
+		changeViewKey = "0x" + change.ViewKey
+	}
 	reqBody, err := json.Marshal(ShieldedPayoutRequest{
 		RequestID:             p.shieldedPayoutRequestID(payment),
 		ApplicationData:       p.shieldedPayoutApplicationData(payment),
@@ -1648,8 +1797,9 @@ func (p *Pool) sendShieldedPayment(ctx context.Context, payment Payment, txType 
 		AmountAntd:            round(payment.Amount),
 		AmountWei:             "0x" + amountWei.Text(16),
 		PayoutTxType:          txType,
-		RecipientViewKey:      "0x" + strings.ToLower(strings.TrimPrefix(payment.RecipientViewKey, "0x")),
-		ChangeViewKey:         "0x" + change.ViewKey,
+		RecipientViewKey:      recipientViewKey,
+		RecipientCode:         payment.RecipientCode,
+		ChangeViewKey:         changeViewKey,
 		PrivacyCommitmentTime: p.cfg.PrivacyCommitmentTime,
 		QuantumResistantTime:  p.cfg.QuantumResistantTime,
 		CreatedAt:             payment.CreatedAt,
@@ -1736,7 +1886,7 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 	var due []Payment
 	for wallet, balance := range p.balances {
 		if balance >= p.cfg.MinPayoutAntd {
-			due = append(due, Payment{Wallet: wallet, RecipientViewKey: p.recipientViewKeys[wallet], Amount: round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd)), Status: "pending", CreatedAt: time.Now()})
+			due = append(due, Payment{Wallet: wallet, RecipientViewKey: p.recipientViewKeys[wallet], RecipientCode: p.recipientCodes[wallet], Amount: round(minFloat(balance, p.cfg.MaxPayoutPerTxAntd)), Status: "pending", CreatedAt: time.Now()})
 		}
 	}
 	p.mu.RUnlock()
