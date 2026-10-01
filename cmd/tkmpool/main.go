@@ -1038,6 +1038,44 @@ func (p *Pool) touchMiner(wallet, worker, viewKey string) {
 	p.savePayoutStateLocked()
 }
 
+// setRecipientCode attaches a miner's public Shield3 payment code to an
+// existing payout address. Spending keys never enter the pool. Miners can
+// also set this automatically by using the full code as their stratum login.
+func (p *Pool) setRecipientCode(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		Wallet      string `json:"wallet"`
+		PaymentCode string `json:"paymentCode"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 128<<10)).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	recipient, err := parseShieldedPaymentCode(req.PaymentCode)
+	if err != nil || recipient.Code == "" {
+		http.Error(w, "a complete tkmshield3 payment code is required", http.StatusBadRequest)
+		return
+	}
+	wallet := normalizeAddress(req.Wallet)
+	if !isValidAddress(wallet) || !strings.EqualFold(wallet, recipient.Address) {
+		http.Error(w, "payment code address does not match wallet", http.StatusBadRequest)
+		return
+	}
+	p.mu.Lock()
+	if p.recipientCodes == nil {
+		p.recipientCodes = make(map[string]string)
+	}
+	p.recipientCodes[wallet] = recipient.Code
+	delete(p.recipientViewKeys, wallet)
+	p.savePayoutStateLocked()
+	p.mu.Unlock()
+	w.Header().Set("content-type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "wallet": wallet, "shield4Ready": true})
+}
+
 func (p *Pool) recordRejectedShare(wallet, worker string) {
 	key := minerKey(wallet, worker)
 	p.mu.Lock()
@@ -1993,6 +2031,15 @@ func (p *Pool) payDueWithConfirmations(ctx context.Context, confirmations int) {
 func (p *Pool) payDueShielded(ctx context.Context, due []Payment, txType string) {
 	for _, payment := range due {
 		originalAmount := payment.Amount
+		// Shield4 encrypts the recipient output to the complete payment code
+		// and binds the recipient's immutable stamp. A legacy address/view key
+		// cannot receive a Shield4 payout, so do not create fresh daemon-funded
+		// liquidity for an unpayable entry; keep it waiting for the miner to
+		// reconnect with a tkmshield3 code.
+		if strings.TrimSpace(payment.RecipientCode) == "" {
+			p.recordPaymentStatuses([]Payment{payment}, "waiting: Shield4 requires the miner's full tkmshield3 payment code; reconnect with the payment code")
+			continue
+		}
 		health, err := p.shieldedPayoutProverHealth(ctx)
 		if err != nil {
 			p.recordPaymentStatuses([]Payment{payment}, "waiting: shielded payout prover health check failed: "+err.Error())
@@ -2181,6 +2228,12 @@ func (p *Pool) serveHTTP(ctx context.Context) error {
 			return
 		}
 		p.writeAdminStatus(w, r)
+	})
+	mux.HandleFunc("/api/admin/recipient-code", func(w http.ResponseWriter, r *http.Request) {
+		if !p.requireAdmin(w, r) {
+			return
+		}
+		p.setRecipientCode(w, r)
 	})
 	mux.HandleFunc("/api/payments/run", func(w http.ResponseWriter, r *http.Request) {
 		if !p.requireAdmin(w, r) {

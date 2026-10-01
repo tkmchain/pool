@@ -92,7 +92,11 @@ For the production privacy/PQ hardfork at `2026-08-10 06:00:00 UTC`, keep these 
 
 After `quantumResistantTime`, payout transactions are sent as TKM PQ transaction type `0x6`. The pool verifies the local `poolWallet` keystore with `tkm_accountAlgorithm` and expects `ML-DSA-87` when `poolWalletPassword` is configured.
 
-After privacy commitments are active, transparent payouts are held instead of broadcast because the chain rejects non-`TKMSHIELD1` user transactions. Mining and share accounting continue, block rewards still accrue to the configured etherbase, and balances remain in Redis until a real shielded payout prover is configured for pool spending.
+After Antartical privacy activation, transparent payouts are held instead of
+broadcast because the chain accepts only Shield3/Shield4 private envelopes for
+ordinary value movement. Mining and share accounting continue, block rewards
+still accrue to the configured etherbase, and balances remain in Redis until a
+complete Shield4 recipient code is available.
 
 To enable shielded payouts, run a separate prover service on a private host that has the shielded note wallet and proving key. Then set these pool config fields and restart the pool:
 
@@ -100,7 +104,7 @@ To enable shielded payouts, run a separate prover service on a private host that
 {
   "shieldedPayoutProverURL": "http://127.0.0.1:8787/payout",
   "shieldedPayoutProverToken": "change-this-token",
-  "shieldedPayoutChangeCode": "tkmshield2.<pool-wallet-public-payment-code>"
+  "shieldedPayoutChangeCode": "tkmshield3.<pool-wallet-public-payment-code>"
 }
 ```
 
@@ -174,7 +178,37 @@ If `shieldedPayoutProverToken` is set, the pool sends `Authorization: Bearer <to
 
 Only after a valid 32-byte transaction hash is returned does the pool mark the payout as `sent` and deduct the miner's Redis balance. If the prover is down or returns an error, the payout remains owed and is retried with the same `requestId` sequence until a sent payout is recorded. The prover should therefore persist request IDs and return the same hash for duplicate requests.
 
-Miners must connect using their full `tkmshield2` payment code after privacy activation, optionally followed by `.worker-name`. The pool extracts the public recipient viewing key and gives it to the prover, so the payout note is encrypted for the miner. Set `shieldedPayoutChangeCode` to the full `tkmshield2` code for the same address as `poolWallet`; this keeps each pool change note recoverable for the next payout. A legacy `0x...` login may still mine and accrue balance, but shielded payout remains safely pending until that miner reconnects with Shield2.
+After Antartical activation, every payout is Shield4. A miner must authorize with the complete `tkmshield3` payment code, optionally followed by `.worker-name`:
+
+```text
+tkmshield3.<base64url-payment-code>.worker1
+```
+
+The code is public recipient material. It contains the stamped owner commitment,
+ML-KEM-1024 incoming and stamp keys, and the ML-DSA-87 authentication needed by
+the prover; it never contains a spending seed. The pool verifies the address in
+the code and sends the code to the Shield4 prover. The prover then checks the
+stamp path against the canonical registry, encrypts the output and change notes,
+and submits a version-4 private envelope. `shieldedPayoutChangeCode` must also
+be a complete `tkmshield3` code for `poolWallet`.
+
+A legacy `0x...` or `tkmshield2...` login may still mine and accrue balance, but
+it cannot receive a Shield4 payout. The pool will leave that balance waiting and
+will not create unnecessary daemon-funded liquidity. Reconnect the miner with
+the full code, or attach it to an existing balance through the authenticated
+admin endpoint:
+
+```sh
+curl -u admin:<adminPassword> -X POST http://127.0.0.1:33230/api/admin/recipient-code \
+  -H 'Content-Type: application/json' \
+  -d '{"wallet":"0x...","paymentCode":"tkmshield3...."}'
+```
+
+The endpoint checks that the code is a mainnet Shield3 code for the supplied
+address and stores only the public code in Redis. It never accepts a seed or
+private key. After registration, use the dashboard's **Run Payments** action;
+the pool will use the already confirmed Shield4 liquidity note and record the
+transaction hash before marking the payout sent.
 
 Redis setup for payment state:
 
