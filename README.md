@@ -32,7 +32,7 @@ Run a full Tkmchain node with RandomX/miner APIs enabled:
 
 ```sh
 gtkm --syncmode=full --http --http.addr 127.0.0.1 \
-  --http.api eth,net,web3,miner,randomx,tkm,tkmprivacy \
+  --http.api eth,net,web3,miner,randomx,tkm,tkmprivacy,tkmname \
   --mine --miner.threads=1 --miner.etherbase=0xYourPoolWallet
 ```
 
@@ -59,6 +59,17 @@ Or start it with the example config:
 ```
 
 Use the payout wallet as username. Worker names are supported with `0xWallet.worker1`. Pool share acceptance uses `shareTarget`; block candidates are still checked against the daemon work target before submission to `gtkm`.
+
+Miners may also authorize with a registered Shield3 username handle, for
+example `@alice#abc2345` or `@alice#abc2345.worker1`. The pool resolves the
+checksummed handle through `tkmname_resolve` on its configured node, verifies
+that the returned mainnet binding contains a valid Shield3 payment code for
+the same address, and credits shares to that resolved address. Keep the node's
+`tkmname` RPC namespace enabled for the pool's private RPC endpoint. Do not
+put a username in `--miner.etherbase`: the node coinbase remains the pool's
+configured mining address; the username selects the pool payout recipient.
+Shielded payouts require the username to resolve to an active stamped Shield3
+identity with a valid payment code.
 
 The pool also keeps the older `mining.subscribe`, `mining.authorize`, and array-style `mining.submit` flow for existing miners. XMRig uses the newer `login`, `job`, `submit`, and `keepalived` flow.
 

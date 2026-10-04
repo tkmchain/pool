@@ -810,7 +810,8 @@ func (p *Pool) handleStratum(conn net.Conn) {
 
 		switch req.Method {
 		case "login":
-			wallet, worker, viewKey = parseXMRigLoginRecipient(req.Params)
+			login := parseXMRigLoginText(req.Params)
+			wallet, worker, viewKey, _ = p.resolveMinerLogin(context.Background(), login)
 			if wallet != "" {
 				session.mu.Lock()
 				session.wallet = wallet
@@ -850,7 +851,8 @@ func (p *Pool) handleStratum(conn net.Conn) {
 			})
 			p.notifyCurrent(session)
 		case "mining.authorize":
-			wallet, worker, viewKey = parseAuthorizeRecipient(req.Params)
+			login := parseAuthorizeText(req.Params)
+			wallet, worker, viewKey, _ = p.resolveMinerLogin(context.Background(), login)
 			if wallet != "" {
 				session.mu.Lock()
 				session.wallet = wallet
@@ -946,12 +948,16 @@ func parseAuthorize(raw json.RawMessage) (string, string) {
 }
 
 func parseAuthorizeRecipient(raw json.RawMessage) (string, string, string) {
+	return parseMinerLoginRecipient(parseAuthorizeText(raw))
+}
+
+func parseAuthorizeText(raw json.RawMessage) string {
 	var params []string
 	_ = json.Unmarshal(raw, &params)
 	if len(params) == 0 {
-		return "", "", ""
+		return ""
 	}
-	return parseMinerLoginRecipient(params[0])
+	return params[0]
 }
 
 func parseXMRigLogin(raw json.RawMessage) (string, string) {
@@ -960,11 +966,77 @@ func parseXMRigLogin(raw json.RawMessage) (string, string) {
 }
 
 func parseXMRigLoginRecipient(raw json.RawMessage) (string, string, string) {
+	return parseMinerLoginRecipient(parseXMRigLoginText(raw))
+}
+
+func parseXMRigLoginText(raw json.RawMessage) string {
 	var params struct {
 		Login string `json:"login"`
+		RigID string `json:"rigid"`
 	}
 	_ = json.Unmarshal(raw, &params)
-	return parseMinerLoginRecipient(params.Login)
+	if params.RigID != "" {
+		if _, worker := splitMinerWorker(params.Login); worker == "" {
+			params.Login += "." + params.RigID
+		}
+	}
+	return params.Login
+}
+
+type resolvedMinerUsername struct {
+	ChainID     uint64 `json:"chainId"`
+	Username    string `json:"username"`
+	Address     string `json:"address"`
+	PaymentCode string `json:"paymentCode"`
+}
+
+// resolveMinerLogin resolves registered Shield3 usernames through the node's
+// chain-aware directory API. The pool stores and credits only the resulting
+// canonical address, and retains the payment code for shielded payouts.
+func (p *Pool) resolveMinerLogin(ctx context.Context, login string) (wallet, worker, recipientCode string, err error) {
+	login = strings.TrimSpace(login)
+	base, worker := splitMinerWorker(login)
+	if !strings.HasPrefix(base, "@") {
+		wallet, worker, recipientCode = parseMinerLoginRecipient(login)
+		if wallet == "" {
+			return "", worker, "", errors.New("invalid miner payout address or payment code")
+		}
+		return wallet, worker, recipientCode, nil
+	}
+	parts := strings.Split(base[1:], "#")
+	if len(parts) != 2 || len(parts[0]) < 3 || len(parts[0]) > 32 || len(parts[1]) != 7 {
+		return "", worker, "", errors.New("username login must be @name#checksum")
+	}
+	for _, c := range parts[0] {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return "", worker, "", errors.New("username contains unsupported characters")
+		}
+	}
+	for _, c := range parts[1] {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '2' && c <= '7') {
+			return "", worker, "", errors.New("username checksum is malformed")
+		}
+	}
+	base = "@" + strings.ToLower(parts[0]) + "#" + strings.ToLower(parts[1])
+	var record resolvedMinerUsername
+	if err := p.rpc.call(ctx, "tkmname_resolve", []string{base}, &record); err != nil {
+		return "", worker, "", fmt.Errorf("resolve mining username through node directory: %w", err)
+	}
+	if record.ChainID != shieldedPaymentChainID || !strings.EqualFold(record.Username, parts[0]) {
+		return "", worker, "", errors.New("username lookup returned a different name or network")
+	}
+	recipient, err := parseShieldedPaymentCode(record.PaymentCode)
+	if err != nil || recipient.Code == "" || !strings.EqualFold(recipient.Address, record.Address) {
+		return "", worker, "", errors.New("username directory returned an invalid Shield3 payout binding")
+	}
+	return recipient.Address, worker, recipient.Code, nil
+}
+
+func splitMinerWorker(login string) (string, string) {
+	if separator := strings.LastIndex(login, "."); separator > 0 && separator < len(login)-1 {
+		return strings.TrimSpace(login[:separator]), strings.TrimSpace(login[separator+1:])
+	}
+	return strings.TrimSpace(login), ""
 }
 
 func jsonRPCResponseID(id any) any {
